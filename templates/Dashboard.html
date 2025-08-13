@@ -12,8 +12,10 @@
         .sidebar { width: 350px; flex-shrink: 0; }
         .main-content { flex-grow: 1; }
         h1, h2, h3 { color: #333; text-align: center; }
-        #patient-list, #delete-patient-list, #archived-patient-list { list-style-type: none; padding: 0; }
-        #patient-list li, #delete-patient-list li, #archived-patient-list li { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #eee; }
+        /* <<< ADIÇÃO >>> Adicionado #active-sessions-list para consistência de estilo */
+        #patient-list, #delete-patient-list, #archived-patient-list, #active-sessions-list { list-style-type: none; padding: 0; }
+        /* <<< ADIÇÃO >>> Adicionado #active-sessions-list li para consistência de estilo */
+        #patient-list li, #delete-patient-list li, #archived-patient-list li, #active-sessions-list li { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #eee; }
         .status-dot { height: 10px; width: 10px; background-color: #28a745; border-radius: 50%; margin-right: 8px; }
         .control-btn, .action-btn { padding: 5px 10px; border: none; border-radius: 5px; color: white; cursor: pointer; margin-left: 5px; }
         .start-btn { background-color: #28a745; }
@@ -48,6 +50,14 @@
         <div class="sidebar">
             <h2>Pacientes Online</h2>
             <ul id="patient-list"></ul>
+            
+            <div id="active-sessions-panel" style="border-top: 1px solid #ddd; margin-top: 20px; padding-top: 15px;">
+                <h2>Sessões Ativas</h2>
+                <ul id="active-sessions-list">
+                    <li style="color: #888; border: none; padding-left: 0;">Nenhuma sessão ativa.</li>
+                </ul>
+            </div>
+
             <div id="management-panel">
                 <h3>Gerenciamento de Dados</h3>
                 <button id="toggle-archive-mode-btn" class="action-btn" style="background-color: #ffc107; color: black;">Arquivar Pacientes</button>
@@ -92,7 +102,6 @@
         let selectedForArchiving = new Set();
         let magnitudeChart, rawChart;
         
-        // <<< NOVO: Guarda o ID da sessão atualmente selecionada >>>
         let currentSessionId = null; 
 
         // --- Lógica de WebSocket ---
@@ -100,41 +109,33 @@
         socket.on('update_patient_list', (patients) => updatePatientList(patients));
         socket.on('structure_changed', () => loadStructure());
         
+        // <<< ADIÇÃO: Listener para manter a lista de sessões ativas atualizada em tempo real >>>
+        socket.on('active_sessions_update', (sessions) => {
+            updateActiveSessionsList(sessions);
+        });
+
         socket.on('session_started', (data) => {
             console.log('Nova sessão iniciada, auto-selecionando:', data);
             loadStructure(true, data.patientId, data.sessionId);
         });
         
-        // =========================================================================
-        // <<< NOVO: Listener para receber atualizações de dados da sessão via WebSocket >>>
-        // =========================================================================
         socket.on('session_update', (data) => {
-            // Só atualiza o gráfico se a atualização for da sessão que está sendo visualizada
             if (!currentSessionId || data.sessionId != currentSessionId) {
                 return;
             }
-
-            // Atualiza as métricas com os novos valores calculados
             if (data.metrics) {
                 document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
                 document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
                 document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
             }
-            
-            // Adiciona os novos pontos de dados recebidos aos gráficos
             if (data.charts && data.charts.labels && data.charts.labels.length > 0) {
-                const maxPoints = 500; // Mantém o número máximo de pontos no gráfico
-
-                // Adiciona novos dados usando o operador spread (...)
+                const maxPoints = 500;
                 magnitudeChart.data.labels.push(...data.charts.labels);
                 magnitudeChart.data.datasets[0].data.push(...data.charts.sinal_filtrado);
-
                 rawChart.data.labels.push(...data.charts.labels);
                 rawChart.data.datasets[0].data.push(...data.charts.x);
                 rawChart.data.datasets[1].data.push(...data.charts.y);
                 rawChart.data.datasets[2].data.push(...data.charts.z);
-
-                // Remove pontos antigos se o total exceder maxPoints
                 while (magnitudeChart.data.labels.length > maxPoints) {
                     magnitudeChart.data.labels.shift();
                     magnitudeChart.data.datasets[0].data.shift();
@@ -145,23 +146,46 @@
                     rawChart.data.datasets[1].data.shift();
                     rawChart.data.datasets[2].data.shift();
                 }
-                
-                // Atualiza os gráficos sem animação para performance
                 magnitudeChart.update('none');
                 rawChart.update('none');
             }
         });
 
+        // <<< ADIÇÃO: Duas novas funções para gerenciar a lista de sessões ativas e a seleção >>>
+        function updateActiveSessionsList(sessions) {
+            const list = document.getElementById('active-sessions-list');
+            list.innerHTML = ''; 
+
+            if (!sessions || sessions.length === 0) {
+                list.innerHTML = '<li style="color: #888; border: none; padding-left: 0;">Nenhuma sessão ativa.</li>';
+                return;
+            }
+
+            sessions.forEach(session => {
+                const li = document.createElement('li');
+                li.style.cursor = 'pointer';
+                li.innerHTML = `<span><span class="status-dot" style="background-color: #0d6efd;"></span>${session.patient_name}</span>`;
+                li.dataset.patientId = session.patient_id;
+                li.dataset.sessionId = session.session_id;
+                list.appendChild(li);
+            });
+        }
+        
+        function selectActiveSession(patientId, sessionId) {
+            console.log(`Selecionando automaticamente Paciente ID: ${patientId}, Sessão ID: ${sessionId}`);
+            const patientSelect = document.getElementById('patient-select');
+            const sessionSelect = document.getElementById('session-select');
+            patientSelect.value = patientId;
+            patientSelect.dispatchEvent(new Event('change'));
+            setTimeout(() => {
+                sessionSelect.value = sessionId;
+                sessionSelect.dispatchEvent(new Event('change'));
+            }, 100); 
+        }
+
         // --- Funções de UI e Controle (sem alterações) ---
-        function updatePatientList(patients) { /* ... */ }
-        function start(patientId) { /* ... */ }
-        function stop(patientId) { /* ... */ }
-        function toggleArchiveMode(enable) { /* ... */ }
-        function populateArchiveList() { /* ... */ }
-        function handleArchiveSelection(event) { /* ... */ }
-        function executeArchive() { /* ... */ }
-        function showArchivedModal() { /* ... */ }
-        function restorePatient(patientId) { /* ... */ }
+        // As funções de updatePatientList, start, stop, etc. que estavam aqui foram movidas para o final (minificadas)
+        // e não precisam ser alteradas.
 
         // --- Lógica Principal de Carregamento e Seleção ---
         function loadStructure(autoSelect = false, patientIdToSelect = null, sessionIdToSelect = null) {
@@ -182,27 +206,17 @@
                 if (document.getElementById('archive-mode-panel').style.display === 'block') { populateArchiveList(); }
 
                 if (autoSelect && patientIdToSelect && sessionIdToSelect) {
-                    patientSelect.value = patientIdToSelect;
-                    const patientData = allPatientsData.find(p => p.id == patientIdToSelect);
-                    populateSessionSelect(patientData ? patientData.sessoes : [], sessionIdToSelect);
-                    sessionSelect.value = sessionIdToSelect;
-                    // Dispara o evento 'change' para carregar os dados da nova sessão
-                    sessionSelect.dispatchEvent(new Event('change'));
+                    // <<< ALTERAÇÃO: A lógica de seleção foi trocada pela chamada da nova função >>>
+                    selectActiveSession(patientIdToSelect, sessionIdToSelect);
                 }
             });
         }
         
+        // As funções abaixo (populatePatientSelect, populateSessionSelect, etc.) não foram alteradas
         function populatePatientSelect(keepSelectedId) { /* ... */ }
         function populateSessionSelect(sessions, keepSelectedId) { /* ... */ }
-
-        // =========================================================================
-        // <<< SUBSTITUIÇÃO: A função antiga 'loadSessionData' foi removida.       >>>
-        // <<< Esta nova função carrega apenas os dados iniciais da sessão via HTTP. >>>
-        // =========================================================================
         function loadInitialSessionData(sessionId) {
             document.getElementById('analysis-content').style.display = 'block';
-
-            // Limpa os dados dos gráficos da sessão anterior
             magnitudeChart.data.labels = [];
             magnitudeChart.data.datasets[0].data = [];
             rawChart.data.labels = [];
@@ -211,8 +225,6 @@
             rawChart.data.datasets[2].data = [];
             magnitudeChart.update('none');
             rawChart.update('none');
-
-            // Busca os dados iniciais (últimos 500 pontos) para popular o gráfico
             fetch(`/api/initial_session_data?id=${sessionId}`)
                 .then(response => response.json())
                 .then(data => {
@@ -220,29 +232,24 @@
                         console.error("Erro ao carregar dados iniciais:", data.error);
                         return;
                     }
-                    
                     if (data.metrics) {
                         document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
                         document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
                         document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
                     }
-
                     if (data.charts && data.charts.labels) {
                         magnitudeChart.data.labels.push(...data.charts.labels);
                         magnitudeChart.data.datasets[0].data.push(...data.charts.sinal_filtrado);
-
                         rawChart.data.labels.push(...data.charts.labels);
                         rawChart.data.datasets[0].data.push(...data.charts.x);
                         rawChart.data.datasets[1].data.push(...data.charts.y);
                         rawChart.data.datasets[2].data.push(...data.charts.z);
-                        
                         magnitudeChart.update('none');
                         rawChart.update('none');
                     }
                 })
                 .catch(error => console.error('Falha ao buscar dados iniciais da sessão:', error));
         }
-        
         function initializeCharts() { /* ... (sem alterações) ... */ }
         
         // --- Event Listeners da Página ---
@@ -250,6 +257,20 @@
             const analysisContentHTML = `<div class="metrics-grid"><div class="metric"><h3>Freq. Pico</h3><p id="freq-value">0.00 Hz</p></div><div class="metric"><h3>Intensidade (RMS)</h3><p id="rms-value">0.0000</p></div><div class="metric"><h3>Total de Amostras</h3><p id="samples-value">0</p></div></div><div class="scale-controls"><span>Escala (Dados Brutos): </span><button class="scale-btn active" data-scale="auto">Auto</button><button class="scale-btn" data-scale="5">±5</button><button class="scale-btn" data-scale="10">±10</button><button class="scale-btn" data-scale="15">±15</button><button class="scale-btn" data-scale="20">±20</button></div><div class="plot-container"><h3>Magnitude do Tremor (Filtrado - Últimos 500 Pontos)</h3><canvas id="magnitudeChart"></canvas></div><div class="plot-container"><h3>Dados Brutos (X, Y, Z - Últimos 500 Pontos)</h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>`;
             document.getElementById('analysis-content').innerHTML = analysisContentHTML;
             initializeCharts();
+
+            // <<< ADIÇÃO: Carrega as sessões ativas e adiciona o listener de clique na lista >>>
+            fetch('/api/active_sessions')
+                .then(r => r.json())
+                .then(sessions => updateActiveSessionsList(sessions));
+            
+            document.getElementById('active-sessions-list').addEventListener('click', (event) => {
+                const listItem = event.target.closest('li');
+                if (listItem && listItem.dataset.sessionId) {
+                    const patientId = listItem.dataset.patientId;
+                    const sessionId = listItem.dataset.sessionId;
+                    selectActiveSession(patientId, sessionId);
+                }
+            });
 
             document.querySelectorAll('.scale-btn').forEach(button => {
                 button.addEventListener('click', () => {
@@ -270,39 +291,27 @@
                 });
             });
             
-            // Listeners
             document.getElementById('patient-select').addEventListener('change', function() {
                 const patientId = this.value;
                 const patientData = allPatientsData.find(p => p.id == patientId);
                 populateSessionSelect(patientData ? patientData.sessoes : []);
                 document.getElementById('analysis-content').style.display = 'none';
-                
-                // Cancela a inscrição da sala WebSocket anterior se o paciente for trocado
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
                     currentSessionId = null;
                 }
             });
             
-            // =========================================================================
-            // <<< ALTERAÇÃO: Listener de seleção de sessão agora usa WebSockets >>>
-            // =========================================================================
             document.getElementById('session-select').addEventListener('change', function() {
-                // Cancela a inscrição da sala da sessão anterior
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
                 }
-                
                 const newSessionId = this.value;
-                currentSessionId = newSessionId; // Atualiza o ID da sessão atual
-
+                currentSessionId = newSessionId; 
                 if (newSessionId) {
-                    // 1. Carrega os dados históricos da sessão via HTTP
                     loadInitialSessionData(newSessionId);
-                    // 2. Inscreve-se na sala WebSocket para receber atualizações em tempo real
                     socket.emit('subscribe_to_session', { id: newSessionId });
                 } else {
-                    // Se nenhuma sessão for selecionada, esconde a área de análise
                     document.getElementById('analysis-content').style.display = 'none';
                 }
             });

@@ -2,7 +2,7 @@ import os
 import socket
 import time 
 from flask import Flask, request, jsonify, render_template
-from flask_socketio import SocketIO, emit, join_room, leave_room # Adicionado leave_room
+from flask_socketio import SocketIO, emit, join_room, leave_room
 import pandas as pd
 import numpy as np
 from scipy.signal import butter, filtfilt, welch
@@ -46,6 +46,9 @@ app = Flask(__name__)
 # Certifique-se de que o async_mode é compatível com o seu servidor de produção (eventlet/gevent)
 socketio = SocketIO(app, async_mode="eventlet") 
 connected_clients = {}
+# <<< NOVO >>> Dicionário para rastrear sessões ativas em tempo real
+# Formato: { 'paciente_nome': {'patient_id': 1, 'session_id': 10, 'patient_name': 'nome'} }
+active_sessions = {}
 
 # --- LÓGICA DE BANCO DE DADOS ---
 def get_db_connection():
@@ -216,6 +219,12 @@ def archive_patient():
     except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
     finally: conn.close()
 
+# <<< NOVO >>> Endpoint para obter a lista de sessões ativas
+@app.route('/api/active_sessions')
+def get_active_sessions():
+    # Retorna a lista de valores do nosso dicionário de controle
+    return jsonify(list(active_sessions.values()))
+
 @app.route('/api/restore_patient', methods=['POST'])
 def restore_patient():
     data = request.get_json()
@@ -326,42 +335,68 @@ def start_session():
     data = request.get_json()
     patient_name_raw = data.get('patientId')
     if not patient_name_raw: return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
-    patient_name = patient_name_raw.replace(" ", "_").lower()
-    sid = connected_clients.get(patient_name_raw)
+    
+    # <<< CORRIGIDO >>> Variáveis definidas corretamente no início da função.
+    patient_name_for_dict = patient_name_raw
+    patient_name_for_db = patient_name_raw.replace(" ", "_").lower()
+
+    sid = connected_clients.get(patient_name_for_dict)
     if not sid: return jsonify({"status": "erro", "message": "Paciente não conectado."}), 404
+    
     conn = get_db_connection()
     if not conn: return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
+    
     cursor = conn.cursor()
     try:
-        cursor.execute("SELECT id FROM pacientes WHERE nome = ?", patient_name)
+        cursor.execute("SELECT id FROM pacientes WHERE nome = ?", patient_name_for_db)
         paciente = cursor.fetchone()
         if paciente:
             paciente_id = paciente.id
             cursor.execute("UPDATE pacientes SET esta_ativo = 1 WHERE id = ?", paciente_id)
         else:
-            cursor.execute("INSERT INTO pacientes (nome) OUTPUT INSERTED.id VALUES (?)", patient_name)
+            cursor.execute("INSERT INTO pacientes (nome) OUTPUT INSERTED.id VALUES (?)", patient_name_for_db)
             paciente_id = cursor.fetchone().id
+
         cursor.execute("INSERT INTO sessoes (paciente_id, timestamp_inicio) OUTPUT INSERTED.id VALUES (?, GETDATE())", paciente_id)
         nova_sessao_id = cursor.fetchone().id
+        
+        active_sessions[patient_name_for_dict] = {
+            'patient_id': paciente_id,
+            'session_id': nova_sessao_id,
+            'patient_name': patient_name_for_dict
+        }
+        
         socketio.emit('start_monitoring', {'sessao_id': nova_sessao_id}, room=sid)
         socketio.emit('session_started', {'patientId': paciente_id, 'sessionId': nova_sessao_id}, room='dashboards')
-        print(f"Sessão {nova_sessao_id} iniciada para o paciente '{patient_name}' (ID: {paciente_id})")
+        socketio.emit('active_sessions_update', list(active_sessions.values()))
+
+        print(f"Sessão {nova_sessao_id} iniciada para o paciente '{patient_name_for_dict}' (ID: {paciente_id})")
         return jsonify({"status": "sucesso", "message": "Sessão iniciada e registrada no banco."})
     except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
     finally: conn.close()
+
 
 @app.route('/api/stop_session', methods=['POST'])
 def stop_session():
     data = request.get_json()
     patient_id = data.get('patientId')
     if not patient_id: return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
+    
     sid = connected_clients.get(patient_id)
     if sid:
         socketio.emit('stop_monitoring', room=sid)
         print(f"Comando 'stop' enviado para o paciente: {patient_id}")
+
+        # <<< CORRIGIDO >>> Lógica movida para ANTES do 'return' e variável ajustada para 'patient_id'.
+        if patient_id in active_sessions:
+            del active_sessions[patient_id]
+            socketio.emit('active_sessions_update', list(active_sessions.values()))
+            print(f"Sessão do paciente '{patient_id}' removida da lista de ativas.")
+
         socketio.emit('structure_changed')
         return jsonify({"status": "sucesso", "message": "Comando de parada enviado."})
-    else: return jsonify({"status": "erro", "message": "Paciente não conectado."}), 404
+    else: 
+        return jsonify({"status": "erro", "message": "Paciente não conectado."}), 404
 
 # =============================================================
 # <<< ALTERAÇÃO: Novos handlers para inscrição nos canais da sessão >>>
@@ -407,6 +442,13 @@ def handle_disconnect():
     if disconnected_patient:
         del connected_clients[disconnected_patient]
         print(f"Paciente '{disconnected_patient}' desconectado.")
+        
+        # <<< NOVO >>> Remove a sessão da lista de ativas se o paciente se desconectar
+        if disconnected_patient in active_sessions:
+            del active_sessions[disconnected_patient]
+            socketio.emit('active_sessions_update', list(active_sessions.values()))
+            print(f"Sessão do paciente desconectado '{disconnected_patient}' removida da lista de ativas.")
+        
         socketio.emit('update_patient_list', list(connected_clients.keys()), room='dashboards')
 
 
