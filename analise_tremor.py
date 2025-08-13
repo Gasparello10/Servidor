@@ -451,7 +451,25 @@ def handle_disconnect():
         
         socketio.emit('update_patient_list', list(connected_clients.keys()), room='dashboards')
 
+# <<< NOVO >>> Handler para quando o cliente (celular) informa que a sessão parou.
+@socketio.on('session_stopped_by_client')
+def handle_session_stopped(data):
+    patient_name = data.get('patientId')
+    if not patient_name:
+        return
 
+    print(f"Recebido evento 'session_stopped_by_client' para o paciente: {patient_name}")
+    
+    # A lógica é a mesma de quando o 'disconnect' ou o botão do site são acionados:
+    # Remove o paciente da lista de sessões ativas.
+    if patient_name in active_sessions:
+        del active_sessions[patient_name]
+        
+        # Emite um evento para todos os dashboards atualizarem a sua lista.
+        socketio.emit('active_sessions_update', list(active_sessions.values()))
+        print(f"Sessão do paciente '{patient_name}' removida da lista de ativas via app.")
+
+        
 # --- Função para obter IP local ---
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
