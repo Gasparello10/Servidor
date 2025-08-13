@@ -12,9 +12,7 @@
         .sidebar { width: 350px; flex-shrink: 0; }
         .main-content { flex-grow: 1; }
         h1, h2, h3 { color: #333; text-align: center; }
-        /* <<< ADIÇÃO >>> Adicionado #active-sessions-list para consistência de estilo */
         #patient-list, #delete-patient-list, #archived-patient-list, #active-sessions-list { list-style-type: none; padding: 0; }
-        /* <<< ADIÇÃO >>> Adicionado #active-sessions-list li para consistência de estilo */
         #patient-list li, #delete-patient-list li, #archived-patient-list li, #active-sessions-list li { display: flex; justify-content: space-between; align-items: center; padding: 10px; border-bottom: 1px solid #eee; }
         .status-dot { height: 10px; width: 10px; background-color: #28a745; border-radius: 50%; margin-right: 8px; }
         .control-btn, .action-btn { padding: 5px 10px; border: none; border-radius: 5px; color: white; cursor: pointer; margin-left: 5px; }
@@ -101,15 +99,15 @@
         let allPatientsData = [];
         let selectedForArchiving = new Set();
         let magnitudeChart, rawChart;
-        
-        let currentSessionId = null; 
+        const MAX_CHART_POINTS = 200;      //Configuração: Limite máximo de pontos no gráfico
+
+        let currentSessionId = null;
 
         // --- Lógica de WebSocket ---
         socket.on('connect', () => socket.emit('join_dashboard'));
         socket.on('update_patient_list', (patients) => updatePatientList(patients));
         socket.on('structure_changed', () => loadStructure());
         
-        // <<< ADIÇÃO: Listener para manter a lista de sessões ativas atualizada em tempo real >>>
         socket.on('active_sessions_update', (sessions) => {
             updateActiveSessionsList(sessions);
         });
@@ -123,35 +121,38 @@
             if (!currentSessionId || data.sessionId != currentSessionId) {
                 return;
             }
+
             if (data.metrics) {
                 document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
                 document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
                 document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
             }
+            
             if (data.charts && data.charts.labels && data.charts.labels.length > 0) {
-                const maxPoints = 500;
                 magnitudeChart.data.labels.push(...data.charts.labels);
                 magnitudeChart.data.datasets[0].data.push(...data.charts.sinal_filtrado);
+
                 rawChart.data.labels.push(...data.charts.labels);
                 rawChart.data.datasets[0].data.push(...data.charts.x);
                 rawChart.data.datasets[1].data.push(...data.charts.y);
                 rawChart.data.datasets[2].data.push(...data.charts.z);
-                while (magnitudeChart.data.labels.length > maxPoints) {
+
+                while (magnitudeChart.data.labels.length > MAX_CHART_POINTS) {
                     magnitudeChart.data.labels.shift();
                     magnitudeChart.data.datasets[0].data.shift();
                 }
-                while (rawChart.data.labels.length > maxPoints) {
+                while (rawChart.data.labels.length > MAX_CHART_POINTS) {
                     rawChart.data.labels.shift();
                     rawChart.data.datasets[0].data.shift();
                     rawChart.data.datasets[1].data.shift();
                     rawChart.data.datasets[2].data.shift();
                 }
+                
                 magnitudeChart.update('none');
                 rawChart.update('none');
             }
         });
 
-        // <<< ADIÇÃO: Duas novas funções para gerenciar a lista de sessões ativas e a seleção >>>
         function updateActiveSessionsList(sessions) {
             const list = document.getElementById('active-sessions-list');
             list.innerHTML = ''; 
@@ -183,9 +184,17 @@
             }, 100); 
         }
 
-        // --- Funções de UI e Controle (sem alterações) ---
-        // As funções de updatePatientList, start, stop, etc. que estavam aqui foram movidas para o final (minificadas)
-        // e não precisam ser alteradas.
+        function updateChartTitles() {
+            const magnitudeTitle = document.getElementById('magnitude-chart-title');
+            const rawTitle = document.getElementById('raw-chart-title');
+
+            if (magnitudeTitle) {
+                magnitudeTitle.innerText = `Magnitude do Tremor (Filtrado - Últimos ${MAX_CHART_POINTS} Pontos)`;
+            }
+            if (rawTitle) {
+                rawTitle.innerText = `Dados Brutos (X, Y, Z - Últimos ${MAX_CHART_POINTS} Pontos)`;
+            }
+        }
 
         // --- Lógica Principal de Carregamento e Seleção ---
         function loadStructure(autoSelect = false, patientIdToSelect = null, sessionIdToSelect = null) {
@@ -206,17 +215,14 @@
                 if (document.getElementById('archive-mode-panel').style.display === 'block') { populateArchiveList(); }
 
                 if (autoSelect && patientIdToSelect && sessionIdToSelect) {
-                    // <<< ALTERAÇÃO: A lógica de seleção foi trocada pela chamada da nova função >>>
                     selectActiveSession(patientIdToSelect, sessionIdToSelect);
                 }
             });
         }
         
-        // As funções abaixo (populatePatientSelect, populateSessionSelect, etc.) não foram alteradas
-        function populatePatientSelect(keepSelectedId) { /* ... */ }
-        function populateSessionSelect(sessions, keepSelectedId) { /* ... */ }
         function loadInitialSessionData(sessionId) {
             document.getElementById('analysis-content').style.display = 'block';
+
             magnitudeChart.data.labels = [];
             magnitudeChart.data.datasets[0].data = [];
             rawChart.data.labels = [];
@@ -225,6 +231,7 @@
             rawChart.data.datasets[2].data = [];
             magnitudeChart.update('none');
             rawChart.update('none');
+
             fetch(`/api/initial_session_data?id=${sessionId}`)
                 .then(response => response.json())
                 .then(data => {
@@ -232,33 +239,37 @@
                         console.error("Erro ao carregar dados iniciais:", data.error);
                         return;
                     }
+                    
                     if (data.metrics) {
                         document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
                         document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
                         document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
                     }
+
                     if (data.charts && data.charts.labels) {
                         magnitudeChart.data.labels.push(...data.charts.labels);
                         magnitudeChart.data.datasets[0].data.push(...data.charts.sinal_filtrado);
+
                         rawChart.data.labels.push(...data.charts.labels);
                         rawChart.data.datasets[0].data.push(...data.charts.x);
                         rawChart.data.datasets[1].data.push(...data.charts.y);
                         rawChart.data.datasets[2].data.push(...data.charts.z);
+                        
                         magnitudeChart.update('none');
                         rawChart.update('none');
                     }
                 })
                 .catch(error => console.error('Falha ao buscar dados iniciais da sessão:', error));
         }
-        function initializeCharts() { /* ... (sem alterações) ... */ }
         
         // --- Event Listeners da Página ---
         document.addEventListener('DOMContentLoaded', () => {
-            const analysisContentHTML = `<div class="metrics-grid"><div class="metric"><h3>Freq. Pico</h3><p id="freq-value">0.00 Hz</p></div><div class="metric"><h3>Intensidade (RMS)</h3><p id="rms-value">0.0000</p></div><div class="metric"><h3>Total de Amostras</h3><p id="samples-value">0</p></div></div><div class="scale-controls"><span>Escala (Dados Brutos): </span><button class="scale-btn active" data-scale="auto">Auto</button><button class="scale-btn" data-scale="5">±5</button><button class="scale-btn" data-scale="10">±10</button><button class="scale-btn" data-scale="15">±15</button><button class="scale-btn" data-scale="20">±20</button></div><div class="plot-container"><h3>Magnitude do Tremor (Filtrado - Últimos 500 Pontos)</h3><canvas id="magnitudeChart"></canvas></div><div class="plot-container"><h3>Dados Brutos (X, Y, Z - Últimos 500 Pontos)</h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>`;
+            const analysisContentHTML = `<div class="metrics-grid"><div class="metric"><h3>Freq. Pico</h3><p id="freq-value">0.00 Hz</p></div><div class="metric"><h3>Intensidade (RMS)</h3><p id="rms-value">0.0000</p></div><div class="metric"><h3>Total de Amostras</h3><p id="samples-value">0</p></div></div><div class="scale-controls"><span>Escala (Dados Brutos): </span><button class="scale-btn active" data-scale="auto">Auto</button><button class="scale-btn" data-scale="5">±5</button><button class="scale-btn" data-scale="10">±10</button><button class="scale-btn" data-scale="15">±15</button><button class="scale-btn" data-scale="20">±20</button></div><div class="plot-container"><h3 id="magnitude-chart-title"></h3><canvas id="magnitudeChart"></canvas></div><div class="plot-container"><h3 id="raw-chart-title"></h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>`;
+            
             document.getElementById('analysis-content').innerHTML = analysisContentHTML;
             initializeCharts();
+            updateChartTitles();
 
-            // <<< ADIÇÃO: Carrega as sessões ativas e adiciona o listener de clique na lista >>>
             fetch('/api/active_sessions')
                 .then(r => r.json())
                 .then(sessions => updateActiveSessionsList(sessions));
@@ -296,6 +307,7 @@
                 const patientData = allPatientsData.find(p => p.id == patientId);
                 populateSessionSelect(patientData ? patientData.sessoes : []);
                 document.getElementById('analysis-content').style.display = 'none';
+                
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
                     currentSessionId = null;
@@ -306,8 +318,10 @@
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
                 }
+                
                 const newSessionId = this.value;
-                currentSessionId = newSessionId; 
+                currentSessionId = newSessionId;
+
                 if (newSessionId) {
                     loadInitialSessionData(newSessionId);
                     socket.emit('subscribe_to_session', { id: newSessionId });
