@@ -90,6 +90,10 @@
                 
                 <div class="session-selector">
                     <div class="selector-group">
+                        <label for="history-patient-select">Paciente</label>
+                        <select id="history-patient-select"></select>
+                    </div>
+                    <div class="selector-group">
                         <label for="history-start-date">Data de Início</label>
                         <input type="date" id="history-start-date" style="padding: 7px;">
                     </div>
@@ -295,7 +299,7 @@
 
         // Função para buscar os dados da API e chamar a renderização
         function fetchAndDisplayHistory() {
-            const patientId = document.getElementById('patient-select').value;
+            const patientId = document.getElementById('history-patient-select').value;
             const startDate = document.getElementById('history-start-date').value;
             const endDate = document.getElementById('history-end-date').value;
 
@@ -332,6 +336,8 @@
             fetch('/api/structure').then(r => r.json()).then(data => {
                 allPatientsData = data;
                 populatePatientSelect(selectedPatientId);
+                // <<< ADIÇÃO PARA POPULAR O NOVO DROPDOWN TAMBÉM >>>
+                populateHistoryPatientSelect(document.getElementById('history-patient-select').value);
                 
                 if (patientSelect.value) {
                     const patientData = allPatientsData.find(p => p.id == patientSelect.value);
@@ -392,23 +398,37 @@
         document.addEventListener('DOMContentLoaded', () => {
             const analysisContentHTML = `<div class="metrics-grid"><div class="metric"><h3>Freq. Pico</h3><p id="freq-value">0.00 Hz</p></div><div class="metric"><h3>Intensidade (RMS)</h3><p id="rms-value">0.0000</p></div><div class="metric"><h3>Total de Amostras</h3><p id="samples-value">0</p></div></div><div class="scale-controls"><span>Escala (Dados Brutos): </span><button class="scale-btn active" data-scale="auto">Auto</button><button class="scale-btn" data-scale="5">±5</button><button class="scale-btn" data-scale="10">±10</button><button class="scale-btn" data-scale="15">±15</button><button class="scale-btn" data-scale="20">±20</button></div><div class="plot-container"><h3 id="magnitude-chart-title"></h3><canvas id="magnitudeChart"></canvas></div><div class="plot-container"><h3 id="raw-chart-title"></h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>`;
             
+            // 1. Prepara as áreas de visualização
             document.getElementById('analysis-content').innerHTML = analysisContentHTML;
-            
-            // Inicializa todos os gráficos
             initializeCharts();
             initializeHistoryCharts(); 
             updateChartTitles();
 
-            // Busca o estado inicial das sessões
+            // 2. Busca o estado inicial das sessões ativas
             fetch('/api/active_sessions')
                 .then(r => r.json())
                 .then(sessions => updateActiveSessionsList(sessions));
             
-            // --- LISTENERS PARA ELEMENTOS EXISTENTES ---
+            // 3. Define constantes para os elementos principais da UI
+            const viewHistoryBtn = document.getElementById('view-history-btn');
+            const backToRealtimeBtn = document.getElementById('back-to-realtime-btn');
+            const fetchHistoryBtn = document.getElementById('fetch-history-btn');
+            const realtimeView = document.getElementById('analysis-content');
+            const historyView = document.getElementById('history-view');
+            const sessionSelector = document.querySelector('.session-selector');
+
+            // 4. Adiciona todos os Event Listeners da página
+            
+            // Listener para cliques na lista de sessões ativas (delegação de evento)
             document.getElementById('active-sessions-list').addEventListener('click', (event) => {
-                // A lógica foi melhorada na função updateActiveSessionsList
+                const li = event.target.closest('li');
+                // Garante que o clique foi em um item da lista e não no botão Parar
+                if (li && li.dataset.sessionId && !event.target.matches('button')) {
+                    selectActiveSession(li.dataset.patientId, li.dataset.sessionId);
+                }
             });
 
+            // Listeners para os botões de escala dos gráficos
             document.querySelectorAll('.scale-btn').forEach(button => {
                 button.addEventListener('click', () => {
                     document.querySelectorAll('.scale-btn').forEach(btn => btn.classList.remove('active'));
@@ -428,14 +448,15 @@
                 });
             });
             
+            // Listener para o dropdown principal de pacientes
             document.getElementById('patient-select').addEventListener('change', function() {
                 const patientId = this.value;
                 const patientData = allPatientsData.find(p => p.id == patientId);
                 populateSessionSelect(patientData ? patientData.sessoes : []);
                 document.getElementById('analysis-content').style.display = 'none';
                 
-                // <<< ALTERAÇÃO >>> Habilita/desabilita o botão de histórico
-                document.getElementById('view-history-btn').disabled = !this.value;
+                // Habilita ou desabilita o botão de histórico
+                viewHistoryBtn.disabled = !this.value;
 
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
@@ -443,11 +464,11 @@
                 }
             });
             
+            // Listener para o dropdown de sessões
             document.getElementById('session-select').addEventListener('change', function() {
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
                 }
-                
                 const newSessionId = this.value;
                 currentSessionId = newSessionId;
 
@@ -459,20 +480,15 @@
                 }
             });
 
-            // --- LISTENERS PARA NOVOS ELEMENTOS DA TELA DE HISTÓRICO ---
-            const viewHistoryBtn = document.getElementById('view-history-btn');
-            const backToRealtimeBtn = document.getElementById('back-to-realtime-btn');
-            const fetchHistoryBtn = document.getElementById('fetch-history-btn');
-            const realtimeView = document.getElementById('analysis-content');
-            const historyView = document.getElementById('history-view');
-            const sessionSelector = document.querySelector('.session-selector');
-
-            // Lógica para alternar para a tela de histórico
+            // Listeners para a nova tela de histórico
             viewHistoryBtn.addEventListener('click', () => {
+                const currentPatientId = document.getElementById('patient-select').value;
+                if (currentPatientId) {
+                    document.getElementById('history-patient-select').value = currentPatientId;
+                }
                 realtimeView.style.display = 'none';
-                sessionSelector.style.display = 'none'; // Esconde também os dropdowns
+                sessionSelector.style.display = 'none';
                 historyView.style.display = 'block';
-                // Sugere datas padrão (hoje e 30 dias atrás)
                 const endDateInput = document.getElementById('history-end-date');
                 const startDateInput = document.getElementById('history-start-date');
                 if (!endDateInput.value) {
@@ -485,21 +501,17 @@
                 }
             });
 
-            // Lógica para voltar para a tela de tempo real
             backToRealtimeBtn.addEventListener('click', () => {
                 historyView.style.display = 'none';
-                sessionSelector.style.display = 'flex'; // Mostra os dropdowns novamente
-                // Se já existia uma sessão selecionada, exibe novamente a tela de tempo real.
+                sessionSelector.style.display = 'flex';
                 if (currentSessionId) {
                     realtimeView.style.display = 'block';
                 }
             });
             
-            // Lógica para o botão "Buscar"
             fetchHistoryBtn.addEventListener('click', fetchAndDisplayHistory);
 
-
-            // --- Listeners de gerenciamento (sem alterações) ---
+            // Listeners do painel de gerenciamento
             document.getElementById('toggle-archive-mode-btn').addEventListener('click', () => toggleArchiveMode(true));
             document.getElementById('cancel-archive-btn').addEventListener('click', () => toggleArchiveMode(false));
             document.getElementById('delete-patient-list').addEventListener('click', handleArchiveSelection);
@@ -507,6 +519,7 @@
             document.getElementById('show-archived-btn').addEventListener('click', showArchivedModal);
             document.getElementById('modal-close-btn').addEventListener('click', () => document.getElementById('archived-modal').style.display = 'none');
             
+            // 5. Carrega a estrutura inicial da página
             loadStructure();
         });
 
@@ -570,6 +583,21 @@
             } else {
                 e.style.display = "none";
                 selectedForArchiving.clear();
+            }
+        }
+
+        // <<< ADIÇÃO DA NOVA FUNÇÃO PARA POPULAR O DROPDOWN DE HISTÓRICO >>>
+        function populateHistoryPatientSelect(keepSelectedId) {
+            const select = document.getElementById("history-patient-select");
+            select.innerHTML = '<option value="">-- Selecione um Paciente --</option>';
+            allPatientsData.forEach(patient => {
+                const option = document.createElement("option");
+                option.value = patient.id;
+                option.textContent = patient.nome; // Usando o nome formatado que vem do servidor
+                select.appendChild(option);
+            });
+            if (keepSelectedId && allPatientsData.some(p => p.id == keepSelectedId)) {
+                select.value = keepSelectedId;
             }
         }
 
