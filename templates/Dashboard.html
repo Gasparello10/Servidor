@@ -108,17 +108,18 @@
 
         // --- Lógica de WebSocket ---
         socket.on('connect', () => socket.emit('join_dashboard'));
-        socket.on('update_patient_list', (patients) => {
-            allOnlinePatients = patients;
+        // <<< NOVO: Listener ÚNICO para receber o estado completo do servidor >>>
+        socket.on('state_update', (data) => {
+            console.log("Estado completo recebido:", data);
+            
+            // 1. Atualiza nossas variáveis de estado locais com a ÚNICA fonte da verdade
+            allOnlinePatients = data.online_patients || [];
+            activePatientNames = new Set((data.active_sessions || []).map(s => s.patient_name));
+            
+            // 2. Redesenha AMBAS as listas com os dados atualizados e sincronizados
             updatePatientList(allOnlinePatients);
+            updateActiveSessionsList(data.active_sessions || []);
         });
-
-        socket.on('active_sessions_update', (sessions) => {
-            activePatientNames = new Set(sessions.map(s => s.patient_name));
-            updateActiveSessionsList(sessions);
-            updatePatientList(allOnlinePatients); 
-        });
-
 
         socket.on('structure_changed', () => loadStructure());
         

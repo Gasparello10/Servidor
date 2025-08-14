@@ -161,6 +161,16 @@ def process_and_push_update(session_id, novas_leituras):
             conn.close()
 
 
+# <<< NOVO: Função centralizada para enviar o estado completo para os dashboards >>>
+def emit_state_update():
+    """Envia o estado atual de clientes conectados e sessões ativas."""
+    state_payload = {
+        'online_patients': list(connected_clients.keys()),
+        'active_sessions': list(active_sessions.values())
+    }
+    socketio.emit('state_update', state_payload, room='dashboards')
+
+
 # --- Endpoints HTTP ---
 @app.route('/')
 def dashboard():
@@ -368,7 +378,7 @@ def start_session():
         
         socketio.emit('start_monitoring', {'sessao_id': nova_sessao_id}, room=sid)
         socketio.emit('session_started', {'patientId': paciente_id, 'sessionId': nova_sessao_id}, room='dashboards')
-        socketio.emit('active_sessions_update', list(active_sessions.values()))
+        emit_state_update()
 
         print(f"Sessão {nova_sessao_id} iniciada para o paciente '{patient_name_for_dict}' (ID: {paciente_id})")
         return jsonify({"status": "sucesso", "message": "Sessão iniciada e registrada no banco."})
@@ -379,24 +389,29 @@ def start_session():
 @app.route('/api/stop_session', methods=['POST'])
 def stop_session():
     data = request.get_json()
-    patient_id = data.get('patientId')
-    if not patient_id: return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
+    patient_id = data.get('patientId') # Este é o nome do paciente
+    if not patient_id: 
+        return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
     
     sid = connected_clients.get(patient_id)
     if sid:
+        # 1. Envia o comando para o celular parar de monitorar
         socketio.emit('stop_monitoring', room=sid)
         print(f"Comando 'stop' enviado para o paciente: {patient_id}")
 
-        # <<< CORRIGIDO >>> Lógica movida para ANTES do 'return' e variável ajustada para 'patient_id'.
+        # 2. Modifica o estado no servidor
         if patient_id in active_sessions:
             del active_sessions[patient_id]
-            socketio.emit('active_sessions_update', list(active_sessions.values()))
             print(f"Sessão do paciente '{patient_id}' removida da lista de ativas.")
 
+        # 3. Notifica os dashboards sobre a mudança de estado E estrutura
+        emit_state_update()
         socketio.emit('structure_changed')
+        
         return jsonify({"status": "sucesso", "message": "Comando de parada enviado."})
     else: 
         return jsonify({"status": "erro", "message": "Paciente não conectado."}), 404
+    
 
 # =============================================================
 # <<< ALTERAÇÃO: Novos handlers para inscrição nos canais da sessão >>>
@@ -422,7 +437,7 @@ def handle_unsubscribe_from_session(data):
 
 @socketio.on('join_dashboard')
 def handle_join_dashboard():
-    join_room('dashboards'); emit('update_patient_list', list(connected_clients.keys()))
+    join_room('dashboards'); emit_state_update()
 
 @socketio.on('register_patient')
 def handle_register(data):
@@ -430,26 +445,29 @@ def handle_register(data):
     if patient_id:
         connected_clients[patient_id] = request.sid
         print(f"Paciente '{patient_id}' registrado com SID: {request.sid}")
-        socketio.emit('update_patient_list', list(connected_clients.keys()), room='dashboards')
+        emit_state_update()
 
 @socketio.on('disconnect')
 def handle_disconnect():
-    # Remove o cliente das listas de conexão e salas
     print(f"Cliente desconectado: {request.sid}")
     disconnected_patient = None
     for patient, sid in list(connected_clients.items()):
-        if sid == request.sid: disconnected_patient = patient; break
+        if sid == request.sid:
+            disconnected_patient = patient
+            break
+    
     if disconnected_patient:
+        # Remove o paciente da lista de conectados
         del connected_clients[disconnected_patient]
         print(f"Paciente '{disconnected_patient}' desconectado.")
-        
-        # <<< NOVO >>> Remove a sessão da lista de ativas se o paciente se desconectar
+
+        # Remove a sessão (se existir) da lista de ativas
         if disconnected_patient in active_sessions:
             del active_sessions[disconnected_patient]
-            socketio.emit('active_sessions_update', list(active_sessions.values()))
             print(f"Sessão do paciente desconectado '{disconnected_patient}' removida da lista de ativas.")
-        
-        socketio.emit('update_patient_list', list(connected_clients.keys()), room='dashboards')
+
+        # Envia uma única atualização de estado completa para todos os dashboards.
+        emit_state_update()
 
 # <<< NOVO >>> Handler para quando o cliente (celular) informa que a sessão parou.
 @socketio.on('session_stopped_by_client')
@@ -466,7 +484,7 @@ def handle_session_stopped(data):
         del active_sessions[patient_name]
         
         # Emite um evento para todos os dashboards atualizarem a sua lista.
-        socketio.emit('active_sessions_update', list(active_sessions.values()))
+        emit_state_update() 
         print(f"Sessão do paciente '{patient_name}' removida da lista de ativas via app.")
 
 # <<< NOVO >>> Handler para quando um cliente se reconecta e informa que já tem uma sessão ativa.
@@ -480,35 +498,35 @@ def handle_resume_session(data):
 
     print(f"Recebido evento 'resume_active_session' do paciente '{patient_name}' para a sessão {session_id}")
 
-    # Para garantir consistência, buscamos o ID do paciente no banco
     conn = get_db_connection()
     if not conn: return
     cursor = conn.cursor()
     try:
-        # O nome no banco de dados não tem espaços e é minúsculo
         patient_name_for_db = patient_name.replace(" ", "_").lower()
         cursor.execute("SELECT id FROM pacientes WHERE nome = ?", patient_name_for_db)
         paciente = cursor.fetchone()
         
         if paciente:
             paciente_id = paciente.id
-            # Adiciona a sessão de volta à lista de controle em memória
             active_sessions[patient_name] = {
                 'patient_id': paciente_id,
                 'session_id': session_id,
                 'patient_name': patient_name
             }
-
+            
+            # <<< MUDANÇA PRINCIPAL AQUI >>>
+            # 1. Avisa o cliente para recarregar a estrutura dos dropdowns
             socketio.emit('structure_changed')
-            # Notifica todos os dashboards que a sessão está ativa novamente
-            socketio.emit('active_sessions_update', list(active_sessions.values()))
+            # 2. Envia o estado completo e atualizado (pacientes online E ativos)
+            emit_state_update()
+
             print(f"Sessão {session_id} do paciente '{patient_name}' restaurada na lista de ativas.")
 
     except Exception as e:
         print(f"Erro ao restaurar sessão: {e}")
     finally:
         conn.close()
-
+        
 # --- Função para obter IP local ---
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
