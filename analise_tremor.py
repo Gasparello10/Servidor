@@ -469,7 +469,46 @@ def handle_session_stopped(data):
         socketio.emit('active_sessions_update', list(active_sessions.values()))
         print(f"Sessão do paciente '{patient_name}' removida da lista de ativas via app.")
 
+# <<< NOVO >>> Handler para quando um cliente se reconecta e informa que já tem uma sessão ativa.
+@socketio.on('resume_active_session')
+def handle_resume_session(data):
+    patient_name = data.get('patientName')
+    session_id = data.get('sessionId')
+
+    if not patient_name or not session_id:
+        return
+
+    print(f"Recebido evento 'resume_active_session' do paciente '{patient_name}' para a sessão {session_id}")
+
+    # Para garantir consistência, buscamos o ID do paciente no banco
+    conn = get_db_connection()
+    if not conn: return
+    cursor = conn.cursor()
+    try:
+        # O nome no banco de dados não tem espaços e é minúsculo
+        patient_name_for_db = patient_name.replace(" ", "_").lower()
+        cursor.execute("SELECT id FROM pacientes WHERE nome = ?", patient_name_for_db)
+        paciente = cursor.fetchone()
         
+        if paciente:
+            paciente_id = paciente.id
+            # Adiciona a sessão de volta à lista de controle em memória
+            active_sessions[patient_name] = {
+                'patient_id': paciente_id,
+                'session_id': session_id,
+                'patient_name': patient_name
+            }
+
+            socketio.emit('structure_changed')
+            # Notifica todos os dashboards que a sessão está ativa novamente
+            socketio.emit('active_sessions_update', list(active_sessions.values()))
+            print(f"Sessão {session_id} do paciente '{patient_name}' restaurada na lista de ativas.")
+
+    except Exception as e:
+        print(f"Erro ao restaurar sessão: {e}")
+    finally:
+        conn.close()
+
 # --- Função para obter IP local ---
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
