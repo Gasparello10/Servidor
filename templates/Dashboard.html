@@ -99,7 +99,7 @@
         let allPatientsData = [];
         let selectedForArchiving = new Set();
         let magnitudeChart, rawChart;
-        const MAX_CHART_POINTS = 200;      //Configuração: Limite máximo de pontos no gráfico
+        const MAX_CHART_POINTS = 200;    //Configuração: Limite máximo de pontos no gráfico
 
         let currentSessionId = null;
 
@@ -339,20 +339,118 @@
             
             loadStructure();
         });
-        
-        // As funções abaixo foram minificadas no seu código original, mantive assim.
-        function updatePatientList(patients){const list=document.getElementById("patient-list");list.innerHTML="",patients&&0!==patients.length?patients.forEach(t=>{const e=document.createElement("li");e.innerHTML=`<span><span class="status-dot"></span>${t}</span><div><button class="control-btn start-btn" onclick="start('${t}')">Iniciar</button><button class="control-btn stop-btn" onclick="stop('${t}')">Parar</button></div>`,list.appendChild(e)}):list.innerHTML='<li style="color: #888;">Nenhum paciente online.</li>'}
-        function start(t){fetch("/api/start_session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({patientId:t})})}
-        function stop(t){fetch("/api/stop_session",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({patientId:t})})}
-        function toggleArchiveMode(t){const e=document.getElementById("archive-mode-panel"),n=[document.getElementById("toggle-archive-mode-btn"),document.getElementById("show-archived-btn")];n.forEach(e=>e.style.display=t?"none":"inline-block"),t?(populateArchiveList(),e.style.display="block"):(e.style.display="none",selectedForArchiving.clear())}
-        function populateArchiveList(){const t=document.getElementById("delete-patient-list");t.innerHTML="",allPatientsData.forEach(e=>{const n=e.sessoes.length,o=document.createElement("li");o.innerHTML=`<label style="display: flex; align-items: center; width: 100%; cursor: pointer;"><input type="checkbox" data-id="${e.id}" style="margin-right: 10px;" /><span>${e.nome} (${n} sessões)</span></label>`,t.appendChild(o)})}
+
+        function updatePatientList(patients) {
+            const list = document.getElementById("patient-list");
+            list.innerHTML = "";
+            if (patients && patients.length !== 0) {
+                patients.forEach(t => {
+                    const e = document.createElement("li");
+                    e.innerHTML = `<span><span class="status-dot"></span>${t}</span><div><button class="control-btn start-btn" onclick="start('${t}')">Iniciar</button><button class="control-btn stop-btn" onclick="stop('${t}')">Parar</button></div>`;
+                    list.appendChild(e);
+                });
+            } else {
+                list.innerHTML = '<li style="color: #888;">Nenhum paciente online.</li>';
+            }
+        }
+
+        function start(t) {
+            fetch("/api/start_session", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ patientId: t })
+            });
+        }
+
+        function stop(t) {
+            fetch("/api/stop_session", {
+                method: "POST",
+                headers: { "Content-Type": "application/json" },
+                body: JSON.stringify({ patientId: t })
+            });
+        }
+
+        function toggleArchiveMode(t) {
+            const e = document.getElementById("archive-mode-panel"),
+                n = [document.getElementById("toggle-archive-mode-btn"), document.getElementById("show-archived-btn")];
+            n.forEach(e => e.style.display = t ? "none" : "inline-block");
+            if (t) {
+                populateArchiveList();
+                e.style.display = "block";
+            } else {
+                e.style.display = "none";
+                selectedForArchiving.clear();
+            }
+        }
+
+        function populateArchiveList() {
+            const t = document.getElementById("delete-patient-list");
+            t.innerHTML = "";
+            allPatientsData.forEach(e => {
+                const n = e.sessoes.length,
+                    o = document.createElement("li");
+                o.innerHTML = `<label style="display: flex; align-items: center; width: 100%; cursor: pointer;"><input type="checkbox" data-id="${e.id}" style="margin-right: 10px;" /><span>${e.nome} (${n} sessões)</span></label>`;
+                t.appendChild(o);
+            });
+        }
         function handleArchiveSelection(t){const e=t.target;"checkbox"===e.type&&(t=parseInt(e.dataset.id),e.checked?selectedForArchiving.add(t):selectedForArchiving.delete(t),document.getElementById("archive-selected-btn").disabled=0===selectedForArchiving.size)}
         function executeArchive(){if(0!==selectedForArchiving.size){const t=Array.from(selectedForArchiving).map(t=>allPatientsData.find(e=>e.id===t)?.nome||`ID ${t}`).join(",\\n- ");confirm(`Tem certeza que deseja ARQUIVAR os seguintes pacientes?\\n\\n- ${t}\\n\\nEles sumirão das listas principais, mas poderão ser restaurados.`)&&(selectedForArchiving.forEach(t=>{fetch("/api/archive_patient",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({patientId:t})})}),toggleArchiveMode(!1))}}
         function showArchivedModal(){fetch("/api/archived_patients").then(t=>t.json()).then(t=>{const e=document.getElementById("archived-patient-list");e.innerHTML="",0===t.length?e.innerHTML="<li>Nenhum paciente arquivado.</li>":t.forEach(t=>{const n=document.createElement("li");n.innerHTML=`<span>${t.nome}</span> <button class="action-btn" onclick="restorePatient(${t.id})">Restaurar</button>`,e.appendChild(n)}),document.getElementById("archived-modal").style.display="block"})}
         function restorePatient(t){fetch("/api/restore_patient",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({patientId:t})}).then(()=>document.getElementById("archived-modal").style.display="none")}
         function populatePatientSelect(t){const e=document.getElementById("patient-select");e.innerHTML='<option value="">-- Selecione um Paciente --</option>',allPatientsData.forEach(t=>{const n=document.createElement("option");n.value=t.id,n.textContent=t.nome,e.appendChild(n)}),t&&allPatientsData.some(e=>e.id==t)&&(e.value=t)}
         function populateSessionSelect(t,e){const n=document.getElementById("session-select");if(n.innerHTML='<option value="">-- Selecione uma Sessão --</option>',t&&0<t.length){t.forEach(e=>{const t=document.createElement("option");t.value=e.id;try{t.textContent=`Sessão de ${new Date(e.timestamp).toLocaleString("pt-BR")}`}catch(e){t.textContent=e.id}n.appendChild(t)}),n.disabled=!1,e&&t.some(t=>t.id==e)&&(n.value=e)}else n.disabled=!0}
-        function initializeCharts(){const t=document.getElementById("magnitudeChart").getContext("2d");magnitudeChart=new Chart(t,{type:"line",data:{labels:[],datasets:[{label:"Sinal de Tremor (Filtrado)",data:[],borderColor:"rgba(90, 90, 158, 1)",borderWidth:1,pointRadius:0}]},options:{animation:!1,responsive:!0,maintainAspectRatio:!0}});const e=document.getElementById("rawChart").getContext("2d");rawChart=new Chart(e,{type:"line",data:{labels:[],datasets:[{label:"Eixo X",data:[],borderColor:"rgba(255, 99, 132, 1)",borderWidth:1,pointRadius:0},{label:"Eixo Y",data:[],borderColor:"rgba(75, 192, 192, 1)",borderWidth:1,pointRadius:0},{label:"Eixo Z",data:[],borderColor:"rgba(54, 162, 235, 1)",borderWidth:1,pointRadius:0}]},options:{animation:!1,responsive:!0,maintainAspectRatio:!0}})}
+        function initializeCharts() {
+    const t = document.getElementById("magnitudeChart").getContext("2d");
+    magnitudeChart = new Chart(t, {
+        type: "line",
+        data: { labels: [], datasets: [{ label: "Sinal de Tremor (Filtrado)", data: [], borderColor: "rgba(90, 90, 158, 1)", borderWidth: 1, pointRadius: 0 }] },
+        options: {
+            animation: false,
+            responsive: true,
+            maintainAspectRatio: true,
+            scales: {
+                x: {
+                    ticks: {
+                        // <<< ALTERAÇÕES AQUI >>>
+                        autoSkip: true,
+                        maxTicksLimit: 8,
+
+                        callback: function(value, index, values) {
+                            const timestamp = this.getLabelForValue(value);
+                            const date = new Date(Number(timestamp));
+                            return date.toLocaleTimeString('pt-BR');
+                        }
+                    }
+                }
+            }
+        }
+    });
+    const e = document.getElementById("rawChart").getContext("2d");
+    rawChart = new Chart(e, {
+        type: "line",
+        data: { labels: [], datasets: [{ label: "Eixo X", data: [], borderColor: "rgba(255, 99, 132, 1)", borderWidth: 1, pointRadius: 0 }, { label: "Eixo Y", data: [], borderColor: "rgba(75, 192, 192, 1)", borderWidth: 1, pointRadius: 0 }, { label: "Eixo Z", data: [], borderColor: "rgba(54, 162, 235, 1)", borderWidth: 1, pointRadius: 0 }] },
+        options: {
+            animation: false,
+            responsive: true,
+            maintainAspectRatio: true,
+            scales: {
+                x: {
+                    ticks: {
+                        // <<< ALTERAÇÕES AQUI >>>
+                        autoSkip: true,
+                        maxTicksLimit: 8,
+
+                        callback: function(value, index, values) {
+                            const timestamp = this.getLabelForValue(value);
+                            const date = new Date(Number(timestamp));
+                            return date.toLocaleTimeString('pt-BR');
+                        }
+                    }
+                }
+            }
+        }
+    });
+}
     </script>
 </body>
 </html>
