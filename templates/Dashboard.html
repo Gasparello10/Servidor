@@ -103,15 +103,26 @@
 
         let currentSessionId = null;
 
+        let allOnlinePatients = [];       // Guarda a lista mais recente de pacientes online
+        let activePatientNames = new Set(); // Guarda os nomes dos pacientes com sessão ativa
+
         // --- Lógica de WebSocket ---
         socket.on('connect', () => socket.emit('join_dashboard'));
-        socket.on('update_patient_list', (patients) => updatePatientList(patients));
-        socket.on('structure_changed', () => loadStructure());
-        
-        socket.on('active_sessions_update', (sessions) => {
-            updateActiveSessionsList(sessions);
+        socket.on('update_patient_list', (patients) => {
+            allOnlinePatients = patients;
+            updatePatientList(allOnlinePatients);
         });
 
+        socket.on('active_sessions_update', (sessions) => {
+            activePatientNames = new Set(sessions.map(s => s.patient_name));
+            updateActiveSessionsList(sessions);
+            updatePatientList(allOnlinePatients); 
+        });
+
+
+        socket.on('structure_changed', () => loadStructure());
+        
+    
         socket.on('session_started', (data) => {
             console.log('Nova sessão iniciada, auto-selecionando:', data);
             loadStructure(true, data.patientId, data.sessionId);
@@ -155,7 +166,7 @@
 
         function updateActiveSessionsList(sessions) {
             const list = document.getElementById('active-sessions-list');
-            list.innerHTML = ''; 
+            list.innerHTML = '';
 
             if (!sessions || sessions.length === 0) {
                 list.innerHTML = '<li style="color: #888; border: none; padding-left: 0;">Nenhuma sessão ativa.</li>';
@@ -165,12 +176,22 @@
             sessions.forEach(session => {
                 const li = document.createElement('li');
                 li.style.cursor = 'pointer';
-                li.innerHTML = `<span><span class="status-dot" style="background-color: #0d6efd;"></span>${session.patient_name}</span>`;
-                li.dataset.patientId = session.patient_id;
-                li.dataset.sessionId = session.session_id;
+
+                // Adiciona um listener para o clique no NOME (para ver os gráficos)
+                const nameSpan = document.createElement('span');
+                nameSpan.innerHTML = `<span class="status-dot" style="background-color: #0d6efd;"></span>${session.patient_name}`;
+                nameSpan.onclick = () => selectActiveSession(session.patient_id, session.session_id);
+                
+                // Adiciona o botão de Parar
+                const stopButtonDiv = document.createElement('div');
+                stopButtonDiv.innerHTML = `<button class="control-btn stop-btn" onclick="stop('${session.patient_name}')">Parar</button>`;
+                
+                li.appendChild(nameSpan);
+                li.appendChild(stopButtonDiv);
                 list.appendChild(li);
             });
         }
+
         
         function selectActiveSession(patientId, sessionId) {
             console.log(`Selecionando automaticamente Paciente ID: ${patientId}, Sessão ID: ${sessionId}`);
@@ -342,16 +363,36 @@
 
         function updatePatientList(patients) {
             const list = document.getElementById("patient-list");
-            list.innerHTML = "";
-            if (patients && patients.length !== 0) {
-                patients.forEach(t => {
-                    const e = document.createElement("li");
-                    e.innerHTML = `<span><span class="status-dot"></span>${t}</span><div><button class="control-btn start-btn" onclick="start('${t}')">Iniciar</button><button class="control-btn stop-btn" onclick="stop('${t}')">Parar</button></div>`;
-                    list.appendChild(e);
-                });
-            } else {
+            list.innerHTML = ""; // Limpa a lista
+
+            if (!patients || patients.length === 0) {
                 list.innerHTML = '<li style="color: #888;">Nenhum paciente online.</li>';
+                return;
             }
+
+            patients.forEach(patientName => {
+                const li = document.createElement("li");
+                
+                // Verifica se o paciente da lista "Online" também está na lista "Ativa"
+                const isPatientActive = activePatientNames.has(patientName);
+
+                // Monta o HTML do botão baseado no estado do paciente (ativo ou não)
+                const buttonHtml = isPatientActive
+                    ? `<button class="control-btn start-btn" disabled>Iniciada</button>` // Botão desabilitado se a sessão já começou
+                    : `<button class="control-btn start-btn" onclick="start('${patientName}')">Iniciar</button>`; // Botão normal para iniciar
+
+                // Define o conteúdo do item da lista
+                li.innerHTML = `
+                    <span>
+                        <span class="status-dot"></span>
+                        ${patientName}
+                    </span>
+                    <div>
+                        ${buttonHtml}
+                    </div>
+                `;
+                list.appendChild(li);
+            });
         }
 
         function start(t) {
