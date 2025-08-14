@@ -9,6 +9,7 @@ from scipy.signal import butter, filtfilt, welch
 from collections import defaultdict
 import logging
 import pyodbc
+from datetime import datetime, timedelta
 
 # ==========================
 # CONFIGURAÇÕES GLOBAIS
@@ -153,6 +154,15 @@ def process_and_push_update(session_id, novas_leituras):
             room_name = f'session_room_{session_id}'
             socketio.emit('session_update', payload, room=room_name)
 
+            try:
+                sql_insert_analise = """
+                    INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, freq_pico)
+                    VALUES (?, GETDATE(), ?, ?);
+                """
+                cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico)
+            except Exception as db_error:
+                print(f"Erro ao salvar métrica histórica: {db_error}")
+        
         except Exception as e:
             print(f"Erro em process_and_push_update: {e}")
             import traceback
@@ -211,6 +221,79 @@ def get_archived_patients():
         return jsonify(archived)
     except Exception as e: return jsonify({"error": str(e)}), 500
     finally: conn.close()
+
+
+@app.route('/api/historical_data')
+def get_historical_data():
+    patient_id = request.args.get('patient_id')
+    # Pega as datas da requisição ou define um padrão (últimos 30 dias)
+    end_date_str = request.args.get('end_date', datetime.utcnow().strftime('%Y%m%d'))
+    start_date_str = request.args.get('start_date', (datetime.utcnow() - timedelta(days=30)).strftime('%Y%m%d'))
+    
+    if not patient_id:
+        return jsonify({"error": "ID do paciente não fornecido"}), 400
+
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Falha na conexão com o banco"}), 500
+
+    cursor = conn.cursor()
+    response_data = {
+        "daily_summary": [],
+        "hourly_summary": []
+    }
+
+    try:
+        # Query para o resumo diário (gráfico de tendência)
+        sql_daily = """
+            SELECT
+                CONVERT(date, aj.timestamp_janela) AS dia,
+                AVG(aj.intensidade_rms) AS media_rms,
+                MAX(aj.intensidade_rms) AS max_rms,
+                AVG(aj.freq_pico) AS media_freq
+            FROM analises_janela aj
+            JOIN sessoes s ON aj.sessao_id = s.id
+            WHERE s.paciente_id = ?
+              AND aj.timestamp_janela BETWEEN ? AND DATEADD(day, 1, ?)
+            GROUP BY CONVERT(date, aj.timestamp_janela)
+            ORDER BY dia;
+        """
+        cursor.execute(sql_daily, int(patient_id), start_date_str, end_date_str)
+        for row in cursor.fetchall():
+            response_data["daily_summary"].append({
+                "date": row.dia.strftime('%Y-%m-%d'),
+                "avg_rms": row.media_rms,
+                "max_rms": row.max_rms,
+                "avg_freq": row.media_freq
+            })
+
+        # Query para o resumo por hora (padrão de ocorrência)
+        sql_hourly = """
+            SELECT
+                DATEPART(hour, aj.timestamp_janela) AS hora,
+                AVG(aj.intensidade_rms) AS media_rms
+            FROM analises_janela aj
+            JOIN sessoes s ON aj.sessao_id = s.id
+            WHERE s.paciente_id = ?
+              AND aj.timestamp_janela BETWEEN ? AND DATEADD(day, 1, ?)
+            GROUP BY DATEPART(hour, aj.timestamp_janela)
+            ORDER BY hora;
+        """
+        cursor.execute(sql_hourly, int(patient_id), start_date_str, end_date_str)
+        for row in cursor.fetchall():
+            response_data["hourly_summary"].append({
+                "hour": row.hora,
+                "avg_rms": row.media_rms
+            })
+        
+        return jsonify(response_data)
+
+    except Exception as e:
+        print(f"Erro ao buscar dados históricos: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
 
 @app.route('/api/archive_patient', methods=['POST'])
 def archive_patient():
@@ -513,8 +596,7 @@ def handle_resume_session(data):
                 'session_id': session_id,
                 'patient_name': patient_name
             }
-            
-            # <<< MUDANÇA PRINCIPAL AQUI >>>
+        
             # 1. Avisa o cliente para recarregar a estrutura dos dropdowns
             socketio.emit('structure_changed')
             # 2. Envia o estado completo e atualizado (pacientes online E ativos)
