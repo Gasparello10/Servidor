@@ -353,46 +353,55 @@
         }
         
         function loadInitialSessionData(sessionId) {
-            document.getElementById('analysis-content').style.display = 'block';
+        document.getElementById('analysis-content').style.display = 'block';
 
-            magnitudeChart.data.labels = [];
-            magnitudeChart.data.datasets[0].data = [];
-            rawChart.data.labels = [];
-            rawChart.data.datasets[0].data = [];
-            rawChart.data.datasets[1].data = [];
-            rawChart.data.datasets[2].data = [];
-            magnitudeChart.update('none');
-            rawChart.update('none');
+        magnitudeChart.data.labels = [];
+        magnitudeChart.data.datasets[0].data = [];
+        rawChart.data.labels = [];
+        rawChart.data.datasets[0].data = [];
+        rawChart.data.datasets[1].data = [];
+        rawChart.data.datasets[2].data = [];
+        magnitudeChart.update('none');
+        rawChart.update('none');
 
-            fetch(`/api/initial_session_data?id=${sessionId}`)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.error) {
-                        console.error("Erro ao carregar dados iniciais:", data.error);
-                        return;
-                    }
+        fetch(`/api/initial_session_data?id=${sessionId}`)
+            .then(response => response.json())
+            .then(data => {
+                if (data.error) {
+                    console.error("Erro ao carregar dados iniciais:", data.error);
+                    return;
+                }
+                
+                if (data.metrics) {
+                    document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
+                    document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
+                    document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
+                }
+
+                if (data.charts && data.charts.labels) {
+                    // <<< ALTERAÇÃO AQUI >>>
+                    // Pega apenas os últimos 'MAX_CHART_POINTS' pontos dos dados recebidos.
+                    const labels = data.charts.labels.slice(-MAX_CHART_POINTS);
+                    const filteredData = data.charts.sinal_filtrado.slice(-MAX_CHART_POINTS);
+                    const xData = data.charts.x.slice(-MAX_CHART_POINTS);
+                    const yData = data.charts.y.slice(-MAX_CHART_POINTS);
+                    const zData = data.charts.z.slice(-MAX_CHART_POINTS);
+
+                    // Adiciona apenas os dados "cortados" aos gráficos
+                    magnitudeChart.data.labels.push(...labels);
+                    magnitudeChart.data.datasets[0].data.push(...filteredData);
+
+                    rawChart.data.labels.push(...labels);
+                    rawChart.data.datasets[0].data.push(...xData);
+                    rawChart.data.datasets[1].data.push(...yData);
+                    rawChart.data.datasets[2].data.push(...zData);
                     
-                    if (data.metrics) {
-                        document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
-                        document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
-                        document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
-                    }
-
-                    if (data.charts && data.charts.labels) {
-                        magnitudeChart.data.labels.push(...data.charts.labels);
-                        magnitudeChart.data.datasets[0].data.push(...data.charts.sinal_filtrado);
-
-                        rawChart.data.labels.push(...data.charts.labels);
-                        rawChart.data.datasets[0].data.push(...data.charts.x);
-                        rawChart.data.datasets[1].data.push(...data.charts.y);
-                        rawChart.data.datasets[2].data.push(...data.charts.z);
-                        
-                        magnitudeChart.update('none');
-                        rawChart.update('none');
-                    }
-                })
-                .catch(error => console.error('Falha ao buscar dados iniciais da sessão:', error));
-        }
+                    magnitudeChart.update('none');
+                    rawChart.update('none');
+                }
+            })
+            .catch(error => console.error('Falha ao buscar dados iniciais da sessão:', error));
+    }
         
 // --- Event Listeners da Página ---
         document.addEventListener('DOMContentLoaded', () => {
