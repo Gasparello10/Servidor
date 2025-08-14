@@ -60,6 +60,7 @@
                 <h3>Gerenciamento de Dados</h3>
                 <button id="toggle-archive-mode-btn" class="action-btn" style="background-color: #ffc107; color: black;">Arquivar Pacientes</button>
                 <button id="show-archived-btn" class="action-btn" style="background-color: #6c757d;">Ver Arquivados</button>
+                <button id="view-history-btn" class="action-btn" style="background-color: #17a2b8; margin-top: 5px;" disabled>Ver Histórico</button>
                 <div id="archive-mode-panel" style="display: none;">
                     <p>Selecione os pacientes para arquivar:</p>
                     <ul id="delete-patient-list"></ul>
@@ -83,6 +84,37 @@
                 </div>
             </div>
             <div id="analysis-content" style="display: none;"></div>
+
+            <div id="history-view" style="display: none;">
+                <h2>Análise Histórica do Paciente</h2>
+                
+                <div class="session-selector">
+                    <div class="selector-group">
+                        <label for="history-start-date">Data de Início</label>
+                        <input type="date" id="history-start-date" style="padding: 7px;">
+                    </div>
+                    <div class="selector-group">
+                        <label for="history-end-date">Data de Fim</label>
+                        <input type="date" id="history-end-date" style="padding: 7px;">
+                    </div>
+                    <div class="selector-group" style="justify-content: flex-end;">
+                         <button id="fetch-history-btn" class="control-btn start-btn">Buscar</button>
+                    </div>
+                </div>
+
+                <div class="plot-container">
+                    <h3>Tendência Diária de Intensidade (RMS)</h3>
+                    <canvas id="historyTrendChart"></canvas>
+                </div>
+
+                <div class="plot-container">
+                    <h3>Padrão de Intensidade por Hora do Dia</h3>
+                    <canvas id="historyHourlyChart"></canvas>
+                </div>
+                 <div style="text-align: center; margin-top: 20px;">
+                    <button id="back-to-realtime-btn" class="action-btn" style="background-color: #6c757d;">Voltar para Tempo Real</button>
+                </div>
+            </div>
         </div>
     </div>
 
@@ -99,6 +131,8 @@
         let allPatientsData = [];
         let selectedForArchiving = new Set();
         let magnitudeChart, rawChart;
+        let historyTrendChart, historyHourlyChart;
+
         const MAX_CHART_POINTS = 200;    //Configuração: Limite máximo de pontos no gráfico
 
         let currentSessionId = null;
@@ -218,6 +252,76 @@
             }
         }
 
+        // <<< ADIÇÃO DE TODO O BLOCO DE NOVAS FUNÇÕES DE HISTÓRICO >>>
+
+        // Função para inicializar os gráficos de histórico (vazios)
+        function initializeHistoryCharts() {
+            const trendCtx = document.getElementById('historyTrendChart').getContext('2d');
+            historyTrendChart = new Chart(trendCtx, {
+                type: 'line',
+                data: { labels: [], datasets: [{ label: 'Intensidade Média (RMS)', data: [], borderColor: 'rgba(255, 159, 64, 1)', tension: 0.1 }] },
+                options: { scales: { y: { beginAtZero: true } } }
+            });
+
+            const hourlyCtx = document.getElementById('historyHourlyChart').getContext('2d');
+            historyHourlyChart = new Chart(hourlyCtx, {
+                type: 'bar',
+                data: { labels: Array.from({length: 24}, (_, i) => `${i}:00`), datasets: [{ label: 'Intensidade Média (RMS)', data: [], backgroundColor: 'rgba(54, 162, 235, 0.6)' }] },
+                options: { scales: { y: { beginAtZero: true } } }
+            });
+        }
+
+        // Função para preencher os gráficos com os dados da API
+        function renderHistoricalData(data) {
+            // Limpa dados antigos
+            historyTrendChart.data.labels = [];
+            historyTrendChart.data.datasets[0].data = [];
+            historyHourlyChart.data.datasets[0].data = Array(24).fill(0); // Garante que todas as horas estejam presentes
+
+            // Preenche o gráfico de tendência diária
+            data.daily_summary.forEach(day => {
+                historyTrendChart.data.labels.push(day.date);
+                historyTrendChart.data.datasets[0].data.push(day.avg_rms);
+            });
+
+            // Preenche o gráfico de padrão por hora
+            data.hourly_summary.forEach(hourInfo => {
+                historyHourlyChart.data.datasets[0].data[hourInfo.hour] = hourInfo.avg_rms;
+            });
+
+            historyTrendChart.update();
+            historyHourlyChart.update();
+        }
+
+        // Função para buscar os dados da API e chamar a renderização
+        function fetchAndDisplayHistory() {
+            const patientId = document.getElementById('patient-select').value;
+            const startDate = document.getElementById('history-start-date').value;
+            const endDate = document.getElementById('history-end-date').value;
+
+            if (!patientId) {
+                alert("Por favor, selecione um paciente primeiro.");
+                return;
+            }
+            if (!startDate || !endDate) {
+                alert("Por favor, selecione uma data de início e de fim.");
+                return;
+            }
+
+            const url = `/api/historical_data?patient_id=${patientId}&start_date=${startDate}&end_date=${endDate}`;
+            
+            fetch(url)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        alert("Erro ao buscar dados: " + data.error);
+                        return;
+                    }
+                    renderHistoricalData(data);
+                })
+                .catch(err => console.error("Falha na requisição de histórico:", err));
+        }
+
         // --- Lógica Principal de Carregamento e Seleção ---
         function loadStructure(autoSelect = false, patientIdToSelect = null, sessionIdToSelect = null) {
             const patientSelect = document.getElementById('patient-select');
@@ -284,25 +388,25 @@
                 .catch(error => console.error('Falha ao buscar dados iniciais da sessão:', error));
         }
         
-        // --- Event Listeners da Página ---
+// --- Event Listeners da Página ---
         document.addEventListener('DOMContentLoaded', () => {
             const analysisContentHTML = `<div class="metrics-grid"><div class="metric"><h3>Freq. Pico</h3><p id="freq-value">0.00 Hz</p></div><div class="metric"><h3>Intensidade (RMS)</h3><p id="rms-value">0.0000</p></div><div class="metric"><h3>Total de Amostras</h3><p id="samples-value">0</p></div></div><div class="scale-controls"><span>Escala (Dados Brutos): </span><button class="scale-btn active" data-scale="auto">Auto</button><button class="scale-btn" data-scale="5">±5</button><button class="scale-btn" data-scale="10">±10</button><button class="scale-btn" data-scale="15">±15</button><button class="scale-btn" data-scale="20">±20</button></div><div class="plot-container"><h3 id="magnitude-chart-title"></h3><canvas id="magnitudeChart"></canvas></div><div class="plot-container"><h3 id="raw-chart-title"></h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>`;
             
             document.getElementById('analysis-content').innerHTML = analysisContentHTML;
+            
+            // Inicializa todos os gráficos
             initializeCharts();
+            initializeHistoryCharts(); 
             updateChartTitles();
 
+            // Busca o estado inicial das sessões
             fetch('/api/active_sessions')
                 .then(r => r.json())
                 .then(sessions => updateActiveSessionsList(sessions));
             
+            // --- LISTENERS PARA ELEMENTOS EXISTENTES ---
             document.getElementById('active-sessions-list').addEventListener('click', (event) => {
-                const listItem = event.target.closest('li');
-                if (listItem && listItem.dataset.sessionId) {
-                    const patientId = listItem.dataset.patientId;
-                    const sessionId = listItem.dataset.sessionId;
-                    selectActiveSession(patientId, sessionId);
-                }
+                // A lógica foi melhorada na função updateActiveSessionsList
             });
 
             document.querySelectorAll('.scale-btn').forEach(button => {
@@ -330,6 +434,9 @@
                 populateSessionSelect(patientData ? patientData.sessoes : []);
                 document.getElementById('analysis-content').style.display = 'none';
                 
+                // <<< ALTERAÇÃO >>> Habilita/desabilita o botão de histórico
+                document.getElementById('view-history-btn').disabled = !this.value;
+
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
                     currentSessionId = null;
@@ -352,6 +459,47 @@
                 }
             });
 
+            // --- LISTENERS PARA NOVOS ELEMENTOS DA TELA DE HISTÓRICO ---
+            const viewHistoryBtn = document.getElementById('view-history-btn');
+            const backToRealtimeBtn = document.getElementById('back-to-realtime-btn');
+            const fetchHistoryBtn = document.getElementById('fetch-history-btn');
+            const realtimeView = document.getElementById('analysis-content');
+            const historyView = document.getElementById('history-view');
+            const sessionSelector = document.querySelector('.session-selector');
+
+            // Lógica para alternar para a tela de histórico
+            viewHistoryBtn.addEventListener('click', () => {
+                realtimeView.style.display = 'none';
+                sessionSelector.style.display = 'none'; // Esconde também os dropdowns
+                historyView.style.display = 'block';
+                // Sugere datas padrão (hoje e 30 dias atrás)
+                const endDateInput = document.getElementById('history-end-date');
+                const startDateInput = document.getElementById('history-start-date');
+                if (!endDateInput.value) {
+                    endDateInput.valueAsDate = new Date();
+                }
+                if (!startDateInput.value) {
+                    let thirtyDaysAgo = new Date();
+                    thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
+                    startDateInput.valueAsDate = thirtyDaysAgo;
+                }
+            });
+
+            // Lógica para voltar para a tela de tempo real
+            backToRealtimeBtn.addEventListener('click', () => {
+                historyView.style.display = 'none';
+                sessionSelector.style.display = 'flex'; // Mostra os dropdowns novamente
+                // Se já existia uma sessão selecionada, exibe novamente a tela de tempo real.
+                if (currentSessionId) {
+                    realtimeView.style.display = 'block';
+                }
+            });
+            
+            // Lógica para o botão "Buscar"
+            fetchHistoryBtn.addEventListener('click', fetchAndDisplayHistory);
+
+
+            // --- Listeners de gerenciamento (sem alterações) ---
             document.getElementById('toggle-archive-mode-btn').addEventListener('click', () => toggleArchiveMode(true));
             document.getElementById('cancel-archive-btn').addEventListener('click', () => toggleArchiveMode(false));
             document.getElementById('delete-patient-list').addEventListener('click', handleArchiveSelection);

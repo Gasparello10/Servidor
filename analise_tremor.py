@@ -223,15 +223,20 @@ def get_archived_patients():
     finally: conn.close()
 
 
+from datetime import datetime, timedelta
+
 @app.route('/api/historical_data')
 def get_historical_data():
     patient_id = request.args.get('patient_id')
-    # Pega as datas da requisição ou define um padrão (últimos 30 dias)
     end_date_str = request.args.get('end_date', datetime.utcnow().strftime('%Y%m%d'))
     start_date_str = request.args.get('start_date', (datetime.utcnow() - timedelta(days=30)).strftime('%Y%m%d'))
-    
+
     if not patient_id:
         return jsonify({"error": "ID do paciente não fornecido"}), 400
+    
+    # Garante que as datas estejam no formato AAAAMMDD, removendo hífens se existirem.
+    start_date_for_sql = start_date_str.replace('-', '')
+    end_date_for_sql = end_date_str.replace('-', '')
 
     conn = get_db_connection()
     if not conn:
@@ -254,11 +259,11 @@ def get_historical_data():
             FROM analises_janela aj
             JOIN sessoes s ON aj.sessao_id = s.id
             WHERE s.paciente_id = ?
-              AND aj.timestamp_janela BETWEEN ? AND DATEADD(day, 1, ?)
+              AND aj.timestamp_janela >= ? AND aj.timestamp_janela < DATEADD(day, 1, ?)
             GROUP BY CONVERT(date, aj.timestamp_janela)
             ORDER BY dia;
         """
-        cursor.execute(sql_daily, int(patient_id), start_date_str, end_date_str)
+        cursor.execute(sql_daily, int(patient_id), start_date_for_sql, end_date_for_sql)
         for row in cursor.fetchall():
             response_data["daily_summary"].append({
                 "date": row.dia.strftime('%Y-%m-%d'),
@@ -275,16 +280,13 @@ def get_historical_data():
             FROM analises_janela aj
             JOIN sessoes s ON aj.sessao_id = s.id
             WHERE s.paciente_id = ?
-              AND aj.timestamp_janela BETWEEN ? AND DATEADD(day, 1, ?)
+              AND aj.timestamp_janela >= ? AND aj.timestamp_janela < DATEADD(day, 1, ?)
             GROUP BY DATEPART(hour, aj.timestamp_janela)
             ORDER BY hora;
         """
-        cursor.execute(sql_hourly, int(patient_id), start_date_str, end_date_str)
-        for row in cursor.fetchall():
-            response_data["hourly_summary"].append({
-                "hour": row.hora,
-                "avg_rms": row.media_rms
-            })
+        cursor.execute(sql_hourly, int(patient_id), start_date_for_sql, end_date_for_sql)
+        hourly_map = {row.hora: row.media_rms for row in cursor.fetchall()}
+        response_data["hourly_summary"] = [{"hour": h, "avg_rms": hourly_map.get(h, 0)} for h in range(24)]
         
         return jsonify(response_data)
 
