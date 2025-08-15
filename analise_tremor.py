@@ -409,9 +409,11 @@ def initial_session_data():
 
         df = pd.DataFrame.from_records(rows, columns=[desc[0] for desc in cursor.description])
         
-        # Análise baseada na janela inicial
-        sinal_analise_centralizado = df['x'] - df['x'].mean()
+        # Análise baseada na magnitude dos 3 eixos
+        df['magnitude'] = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2)
+        sinal_analise_centralizado = df['magnitude'] - df['magnitude'].mean()
         sinal_analise_filtrado = filtrar_sinal_passa_faixa(sinal_analise_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        
         intensidade_rms = np.sqrt(np.mean(sinal_analise_filtrado**2)) if sinal_analise_filtrado.any() else 0.0
         freq_pico = analisar_frequencia_com_welch(sinal_analise_filtrado, TAXA_AMOSTRAGEM) if sinal_analise_filtrado.any() else 0.0
 
@@ -431,7 +433,7 @@ def initial_session_data():
     finally:
         conn.close()
 
-
+        
 @app.route('/api/start_session', methods=['POST'])
 def start_session():
     data = request.get_json()
