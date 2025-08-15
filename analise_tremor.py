@@ -16,7 +16,7 @@ from datetime import datetime, timedelta
 # ==========================
 # --- Parâmetros de análise de sinal ---
 TAXA_AMOSTRAGEM = 50              # Hz
-FREQ_CORTE_BAIXA = 3.0            # Hz
+FREQ_CORTE_BAIXA = 1.0            # Hz
 FREQ_CORTE_ALTA = 8.0             # Hz
 JANELA_DE_ANALISE = 1000          # Nº de amostras para cálculo de RMS e Welch
 NPERSEG_WELCH = 512   
@@ -96,14 +96,20 @@ def process_and_push_update(session_id, novas_leituras):
             cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", int(session_id))
             total_amostras = cursor.fetchone()[0]
 
-            # 2. Busca a última janela de dados para fazer a análise de RMS e Frequência
-            sql_janela_analise = f"SELECT TOP ({JANELA_DE_ANALISE}) x FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
+            # <<< ALTERAÇÃO 1: Buscar os 3 eixos (x, y, z) para a análise >>>
+            sql_janela_analise = f"SELECT TOP ({JANELA_DE_ANALISE}) x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
             cursor.execute(sql_janela_analise, int(session_id))
             analysis_rows = cursor.fetchall()
             if not analysis_rows: return
             
-            df_analysis = pd.DataFrame.from_records(analysis_rows, columns=['x'])
-            sinal_analise_centralizado = df_analysis['x'] - df_analysis['x'].mean()
+            # <<< ALTERAÇÃO 2: Criar o DataFrame com as 3 colunas >>>
+            df_analysis = pd.DataFrame.from_records(analysis_rows, columns=['x', 'y', 'z'])
+            
+            # <<< ALTERAÇÃO 3: Calcular a magnitude do vetor de aceleração >>>
+            df_analysis['magnitude'] = np.sqrt(df_analysis['x']**2 + df_analysis['y']**2 + df_analysis['z']**2)
+
+            # <<< ALTERAÇÃO 4: Usar o sinal de magnitude para toda a análise >>>
+            sinal_analise_centralizado = df_analysis['magnitude'] - df_analysis['magnitude'].mean()
             sinal_analise_filtrado = filtrar_sinal_passa_faixa(sinal_analise_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             
             intensidade_rms = np.sqrt(np.mean(sinal_analise_filtrado**2)) if sinal_analise_filtrado.any() else 0.0
@@ -114,6 +120,7 @@ def process_and_push_update(session_id, novas_leituras):
             df_novos_dados.rename(columns={'timestamp': 'timestamp_ms'}, inplace=True)
 
             # Busca pontos anteriores para dar contexto ao filtro e evitar falhas com pacotes pequenos
+            # (Nota: A parte visual do filtro no gráfico continua usando o eixo X por simplicidade)
             PONTOS_CONTEXTO = 40
             primeiro_timestamp_novo = df_novos_dados['timestamp_ms'].iloc[0]
             sql_contexto = f"SELECT TOP ({PONTOS_CONTEXTO}) x FROM leituras WHERE sessao_id = ? AND timestamp_ms < ? ORDER BY timestamp_ms DESC"
