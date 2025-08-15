@@ -60,7 +60,7 @@
                 <h3>Gerenciamento de Dados</h3>
                 <button id="toggle-archive-mode-btn" class="action-btn" style="background-color: #ffc107; color: black;">Arquivar Pacientes</button>
                 <button id="show-archived-btn" class="action-btn" style="background-color: #6c757d;">Ver Arquivados</button>
-                <button id="view-history-btn" class="action-btn" style="background-color: #17a2b8; margin-top: 5px;" disabled>Ver Histórico</button>
+                <button id="view-history-btn" class="action-btn" style="background-color: #17a2b8; margin-top: 5px;">Ver Histórico</button>
                 <div id="archive-mode-panel" style="display: none;">
                     <p>Selecione os pacientes para arquivar:</p>
                     <ul id="delete-patient-list"></ul>
@@ -465,7 +465,7 @@
                 document.getElementById('analysis-content').style.display = 'none';
                 
                 // Habilita ou desabilita o botão de histórico
-                viewHistoryBtn.disabled = !this.value;
+                //viewHistoryBtn.disabled = !this.value;
 
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
