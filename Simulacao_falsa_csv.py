@@ -8,7 +8,7 @@ TAXA_AMOSTRAGEM_HZ = 50
 FREQUENCIA_SINAL_HZ = 6.0
 AMPLITUDE_SINAL = 15.0
 GRAVIDADE = 9.8
-NIVEL_RUIDO = 5
+NIVEL_RUIDO = 0
 NOME_ARQUIVO = 'simulacao_20min_6hz.csv'
 # ---------------------------------------------------------
 
@@ -32,7 +32,7 @@ with open(NOME_ARQUIVO, 'w', newline='') as csvfile:
         
         # --- CORREÇÃO APLICADA AQUI ---
         # Gera o sinal de seno para o eixo Z, somando à gravidade
-        sinal_puro_x = AMPLITUDE_SINAL * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ/2 * tempo_atual_seg)
+        sinal_puro_x = AMPLITUDE_SINAL/2 * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ/2 * tempo_atual_seg)
         sinal_puro_y = AMPLITUDE_SINAL * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ * tempo_atual_seg)
         sinal_puro_z = AMPLITUDE_SINAL * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ * tempo_atual_seg)
 
