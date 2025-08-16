@@ -231,6 +231,51 @@ def get_archived_patients():
     finally: conn.close()
 
 
+@app.route('/api/monthly_heatmap')
+def get_monthly_heatmap():
+    patient_id = request.args.get('patient_id')
+    year = request.args.get('year')
+    month = request.args.get('month')
+
+    if not all([patient_id, year, month]):
+        return jsonify({"error": "Parâmetros 'patient_id', 'year' e 'month' são obrigatórios."}), 400
+
+    try:
+        # Garante que os parâmetros são inteiros para evitar SQL Injection
+        patient_id, year, month = int(patient_id), int(year), int(month)
+    except ValueError:
+        return jsonify({"error": "Parâmetros devem ser números inteiros."}), 400
+
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Falha na conexão com o banco"}), 500
+
+    cursor = conn.cursor()
+    # Query para calcular a média de RMS para cada dia do mês especificado
+    sql = """
+        SELECT
+            DAY(aj.timestamp_janela) as dia,
+            AVG(aj.intensidade_rms) as media_rms
+        FROM analises_janela aj
+        JOIN sessoes s ON aj.sessao_id = s.id
+        WHERE
+            s.paciente_id = ? AND
+            YEAR(aj.timestamp_janela) = ? AND
+            MONTH(aj.timestamp_janela) = ?
+        GROUP BY DAY(aj.timestamp_janela)
+        ORDER BY dia;
+    """
+    try:
+        cursor.execute(sql, patient_id, year, month)
+        # Transforma o resultado em um dicionário {dia: media_rms} para fácil acesso no frontend
+        heatmap_data = {row.dia: row.media_rms for row in cursor.fetchall()}
+        return jsonify(heatmap_data)
+    except Exception as e:
+        print(f"Erro ao buscar dados para o heatmap: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
 @app.route('/api/historical_data')
 def get_historical_data():
     patient_id = request.args.get('patient_id')

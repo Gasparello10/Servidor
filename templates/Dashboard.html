@@ -41,6 +41,76 @@
         .scale-controls { text-align: center; margin: 20px 0 10px 0; }
         .scale-btn { padding: 5px 10px; margin: 0 4px; border-radius: 4px; border: 1px solid #ccc; background-color: #f0f0f0; cursor: pointer; }
         .scale-btn.active { background-color: #007bff; color: white; border-color: #007bff; }
+
+        /* Estilos para o Heatmap */
+        .heatmap-container {
+            margin-top: 25px;
+            padding: 15px;
+            background-color: #f8f9fa;
+            border: 1px solid #dee2e6;
+            border-radius: 8px;
+        }
+        .heatmap-header {
+            display: flex;
+            justify-content: space-between;
+            align-items: center;
+            margin-bottom: 15px;
+        }
+        .heatmap-header button {
+            background: none;
+            border: 1px solid #ccc;
+            border-radius: 5px;
+            cursor: pointer;
+            font-size: 1.2em;
+            padding: 5px 12px;
+        }
+         .heatmap-header button:hover {
+            background-color: #e9e9e9;
+         }
+        .heatmap-header h3 {
+            margin: 0;
+            font-size: 1.4em;
+        }
+        .heatmap-grid {
+            display: grid;
+            grid-template-columns: repeat(7, 1fr);
+            gap: 5px;
+        }
+        .heatmap-day, .heatmap-weekday {
+            padding: 10px 5px;
+            text-align: center;
+            border-radius: 4px;
+        }
+        .heatmap-weekday {
+            font-weight: bold;
+            background-color: #e9ecef;
+        }
+        .heatmap-day {
+            background-color: #e0e0e0; /* Cor para dias sem dados */
+            color: #777;
+            min-height: 40px;
+            display: flex;
+            flex-direction: column;
+            justify-content: center;
+            align-items: center;
+            font-size: 0.9em;
+        }
+        .heatmap-day.has-data {
+            cursor: pointer;
+            color: black;
+            font-weight: bold;
+        }
+         .heatmap-day.has-data:hover {
+            outline: 2px solid #0056b3;
+         }
+        .heatmap-day.selected {
+             outline: 3px solid #000;
+             outline-offset: 2px;
+        }
+        .heatmap-day span {
+            font-size: 1.2em;
+            margin-bottom: 4px;
+        }
     </style>
 </head>
 <body>
@@ -87,6 +157,16 @@
 
             <div id="history-view" style="display: none;">
                 <h2>Análise Histórica do Paciente</h2>
+
+                <div class="heatmap-container">
+                    <div class="heatmap-header">
+                        <button id="prev-month-btn">&lt;</button>
+                        <h3 id="month-year-title">Carregando...</h3>
+                        <button id="next-month-btn">&gt;</button>
+                    </div>
+                    <div class="heatmap-grid" id="heatmap-weekdays"></div>
+                    <div class="heatmap-grid" id="heatmap-days"></div>
+                </div>
                 
                 <div class="session-selector">
                     <div class="selector-group">
@@ -145,56 +225,41 @@
         let magnitudeChart, rawChart;
         let historyTrendChart, historyIntervalChart;
 
-        const MAX_CHART_POINTS = 200;    //Configuração: Limite máximo de pontos no gráfico
+        const MAX_CHART_POINTS = 200;
 
         let currentSessionId = null;
+        let allOnlinePatients = [];
+        let activePatientNames = new Set();
 
-        let allOnlinePatients = [];       // Guarda a lista mais recente de pacientes online
-        let activePatientNames = new Set(); // Guarda os nomes dos pacientes com sessão ativa
+        let currentHistoryDate = new Date();
+        let currentHeatmapData = {};
 
         // --- Lógica de WebSocket ---
         socket.on('connect', () => socket.emit('join_dashboard'));
-        // <<< NOVO: Listener ÚNICO para receber o estado completo do servidor >>>
         socket.on('state_update', (data) => {
-            console.log("Estado completo recebido:", data);
-            
-            // 1. Atualiza nossas variáveis de estado locais com a ÚNICA fonte da verdade
             allOnlinePatients = data.online_patients || [];
             activePatientNames = new Set((data.active_sessions || []).map(s => s.patient_name));
-            
-            // 2. Redesenha AMBAS as listas com os dados atualizados e sincronizados
             updatePatientList(allOnlinePatients);
             updateActiveSessionsList(data.active_sessions || []);
         });
-
         socket.on('structure_changed', () => loadStructure());
-        
-    
         socket.on('session_started', (data) => {
-            console.log('Nova sessão iniciada, auto-selecionando:', data);
             loadStructure(true, data.patientId, data.sessionId);
         });
-        
         socket.on('session_update', (data) => {
-            if (!currentSessionId || data.sessionId != currentSessionId) {
-                return;
-            }
-
+            if (!currentSessionId || data.sessionId != currentSessionId) return;
             if (data.metrics) {
                 document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
                 document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
                 document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
             }
-            
             if (data.charts && data.charts.labels && data.charts.labels.length > 0) {
                 magnitudeChart.data.labels.push(...data.charts.labels);
                 magnitudeChart.data.datasets[0].data.push(...data.charts.sinal_filtrado);
-
                 rawChart.data.labels.push(...data.charts.labels);
                 rawChart.data.datasets[0].data.push(...data.charts.x);
                 rawChart.data.datasets[1].data.push(...data.charts.y);
                 rawChart.data.datasets[2].data.push(...data.charts.z);
-
                 while (magnitudeChart.data.labels.length > MAX_CHART_POINTS) {
                     magnitudeChart.data.labels.shift();
                     magnitudeChart.data.datasets[0].data.shift();
@@ -205,7 +270,6 @@
                     rawChart.data.datasets[1].data.shift();
                     rawChart.data.datasets[2].data.shift();
                 }
-                
                 magnitudeChart.update('none');
                 rawChart.update('none');
             }
@@ -214,34 +278,25 @@
         function updateActiveSessionsList(sessions) {
             const list = document.getElementById('active-sessions-list');
             list.innerHTML = '';
-
             if (!sessions || sessions.length === 0) {
                 list.innerHTML = '<li style="color: #888; border: none; padding-left: 0;">Nenhuma sessão ativa.</li>';
                 return;
             }
-
             sessions.forEach(session => {
                 const li = document.createElement('li');
                 li.style.cursor = 'pointer';
-
-                // Adiciona um listener para o clique no NOME (para ver os gráficos)
                 const nameSpan = document.createElement('span');
                 nameSpan.innerHTML = `<span class="status-dot" style="background-color: #0d6efd;"></span>${session.patient_name}`;
                 nameSpan.onclick = () => selectActiveSession(session.patient_id, session.session_id);
-                
-                // Adiciona o botão de Parar
                 const stopButtonDiv = document.createElement('div');
                 stopButtonDiv.innerHTML = `<button class="control-btn stop-btn" onclick="stop('${session.patient_name}')">Parar</button>`;
-                
                 li.appendChild(nameSpan);
                 li.appendChild(stopButtonDiv);
                 list.appendChild(li);
             });
         }
 
-        
         function selectActiveSession(patientId, sessionId) {
-            console.log(`Selecionando automaticamente Paciente ID: ${patientId}, Sessão ID: ${sessionId}`);
             const patientSelect = document.getElementById('patient-select');
             const sessionSelect = document.getElementById('session-select');
             patientSelect.value = patientId;
@@ -255,122 +310,156 @@
         function updateChartTitles() {
             const magnitudeTitle = document.getElementById('magnitude-chart-title');
             const rawTitle = document.getElementById('raw-chart-title');
-
-            if (magnitudeTitle) {
-                magnitudeTitle.innerText = `Magnitude do Tremor (Filtrado - Últimos ${MAX_CHART_POINTS} Pontos)`;
-            }
-            if (rawTitle) {
-                rawTitle.innerText = `Dados Brutos (X, Y, Z - Últimos ${MAX_CHART_POINTS} Pontos)`;
-            }
+            if (magnitudeTitle) magnitudeTitle.innerText = `Magnitude (Filtrado - Últimos ${MAX_CHART_POINTS} Pontos)`;
+            if (rawTitle) rawTitle.innerText = `Dados Brutos (X, Y, Z - Últimos ${MAX_CHART_POINTS} Pontos)`;
         }
 
-        // <<< ADIÇÃO DE TODO O BLOCO DE NOVAS FUNÇÕES DE HISTÓRICO >>>
+        // --- Funções do Heatmap e Análise Histórica ---
 
-        // Função para inicializar os gráficos de histórico (vazios)
-function initializeHistoryCharts() {
-    const trendCtx = document.getElementById('historyTrendChart').getContext('2d');
-    historyTrendChart = new Chart(trendCtx, {
-        type: 'line',
-        data: { labels: [], datasets: [{ label: 'Intensidade Média (RMS)', data: [], borderColor: 'rgba(255, 159, 64, 1)', tension: 0.1 }] },
-        options: { scales: { y: { beginAtZero: true } } }
-    });
+        function getColorForValue(value, min, max) {
+            if (value <= 0) return '#e0e0e0';
+            const range = max - min;
+            if (range <= 0) return 'rgb(255, 180, 0)';
+            const ratio = (value - min) / range;
+            const h = (1 - ratio) * 120; // 120 (verde) -> 0 (vermelho)
+            return `hsl(${h}, 100%, 50%)`;
+        }
 
-    // <<< ALTERAÇÕES AQUI >>>
-    // 1. Aponta para o novo ID do canvas: 'historyIntervalChart'
-    const intervalCtx = document.getElementById('historyIntervalChart').getContext('2d');
-    // 2. Usa a nova variável: 'historyIntervalChart'
-    historyIntervalChart = new Chart(intervalCtx, {
-        type: 'bar',
-        // Os 'labels' e 'data' começam vazios, pois serão preenchidos dinamicamente
-        data: { labels: [], datasets: [{ label: 'Intensidade Média (RMS)', data: [], backgroundColor: 'rgba(54, 162, 235, 0.6)' }] },
-        options: { scales: { y: { beginAtZero: true } } }
-    });
-}
-        // Função para preencher os gráficos com os dados da API
-        function renderHistoricalData(data) {
-            // Limpa dados antigos do gráfico de tendência
-            historyTrendChart.data.labels = [];
-            historyTrendChart.data.datasets[0].data = [];
-
-            // Preenche o gráfico de tendência diária (nenhuma mudança aqui)
-            data.daily_summary.forEach(day => {
-                historyTrendChart.data.labels.push(day.date);
-                historyTrendChart.data.datasets[0].data.push(day.avg_rms);
+        function renderHeatmap(year, month) {
+            const daysGrid = document.getElementById('heatmap-days');
+            const weekdaysGrid = document.getElementById('heatmap-weekdays');
+            const title = document.getElementById('month-year-title');
+            daysGrid.innerHTML = '';
+            weekdaysGrid.innerHTML = '';
+            title.textContent = new Date(year, month).toLocaleString('pt-BR', { month: 'long', year: 'numeric' });
+            const weekdays = ['Dom', 'Seg', 'Ter', 'Qua', 'Qui', 'Sex', 'Sáb'];
+            weekdays.forEach(day => {
+                weekdaysGrid.innerHTML += `<div class="heatmap-weekday">${day}</div>`;
             });
+            const firstDayOfMonth = new Date(year, month, 1).getDay();
+            const daysInMonth = new Date(year, month + 1, 0).getDate();
+            for (let i = 0; i < firstDayOfMonth; i++) {
+                daysGrid.innerHTML += '<div></div>';
+            }
+            const rmsValues = Object.values(currentHeatmapData).filter(v => v > 0);
+            const minRms = rmsValues.length > 0 ? Math.min(...rmsValues) : 0;
+            const maxRms = rmsValues.length > 0 ? Math.max(...rmsValues) : 0;
+            for (let day = 1; day <= daysInMonth; day++) {
+                const dayData = currentHeatmapData[day];
+                const cell = document.createElement('div');
+                cell.classList.add('heatmap-day');
+                if (dayData) {
+                    cell.classList.add('has-data');
+                    cell.style.backgroundColor = getColorForValue(dayData, minRms, maxRms);
+                    cell.innerHTML = `<span>${day}</span><small>${dayData.toFixed(4)}</small>`;
+                    cell.dataset.date = `${year}-${String(month + 1).padStart(2, '0')}-${String(day).padStart(2, '0')}`;
+                    cell.onclick = () => {
+                        document.querySelectorAll('.heatmap-day.selected').forEach(el => el.classList.remove('selected'));
+                        cell.classList.add('selected');
+                        fetchAndDisplayDayDetail(cell.dataset.date);
+                    };
+                } else {
+                    cell.innerHTML = `<span>${day}</span>`;
+                }
+                daysGrid.appendChild(cell);
+            }
+        }
+        
+        function fetchAndDisplayDayDetail(dateString) {
+            const patientId = document.getElementById('history-patient-select').value;
+            const activeIntervalBtn = document.querySelector('#history-view .scale-btn.active');
+            const interval = activeIntervalBtn ? activeIntervalBtn.dataset.interval : '60';
+            const url = `/api/historical_data?patient_id=${patientId}&start_date=${dateString}&end_date=${dateString}&interval=${interval}`;
+            fetch(url).then(response => response.json()).then(data => {
+                if (data.error) {
+                    alert("Erro ao buscar dados do dia: " + data.error);
+                    return;
+                }
+                historyIntervalChart.data.labels = data.interval_summary.map(item => item.label);
+                historyIntervalChart.data.datasets[0].data = data.interval_summary.map(item => item.avg_rms);
+                historyIntervalChart.update();
+            }).catch(err => console.error("Falha na requisição de detalhes do dia:", err));
+        }
 
-            // <<< ALTERAÇÕES AQUI >>>
-            // Limpa e preenche o gráfico de padrão por intervalo com os novos dados
+        function fetchAndRenderHeatmap() {
+            const patientId = document.getElementById('history-patient-select').value;
+            const title = document.getElementById('month-year-title');
+            const daysGrid = document.getElementById('heatmap-days');
+
+            if (!patientId) {
+                title.textContent = "Selecione um Paciente";
+                daysGrid.innerHTML = `<p style="grid-column: span 7; text-align: center;">Selecione um paciente no menu acima.</p>`;
+                return;
+            }
+            title.textContent = `Carregando ${new Date(currentHistoryDate).toLocaleString('pt-BR', { month: 'long', year: 'numeric' })}...`
+            const year = currentHistoryDate.getFullYear();
+            const month = currentHistoryDate.getMonth() + 1;
+            fetch(`/api/monthly_heatmap?patient_id=${patientId}&year=${year}&month=${month}`).then(r => r.json()).then(data => {
+                if(data.error) {
+                    alert(data.error);
+                    title.textContent = "Erro ao Carregar";
+                    daysGrid.innerHTML = `<p style="grid-column: span 7; text-align: center; color: red;">Não foi possível carregar os dados.</p>`;
+                    return;
+                }
+                currentHeatmapData = data;
+                renderHeatmap(year, currentHistoryDate.getMonth());
+            }).catch(err => {
+                console.error("Falha ao buscar dados do heatmap:", err);
+                title.textContent = "Erro ao Carregar";
+                daysGrid.innerHTML = `<p style="grid-column: span 7; text-align: center; color: red;">Não foi possível carregar os dados.</p>`;
+            });
+        }
+
+        function initializeHistoryCharts() {
+            const trendCtx = document.getElementById('historyTrendChart').getContext('2d');
+            historyTrendChart = new Chart(trendCtx, { type: 'line', data: { labels: [], datasets: [{ label: 'Intensidade Média (RMS)', data: [], borderColor: 'rgba(255, 159, 64, 1)', tension: 0.1 }] }, options: { scales: { y: { beginAtZero: true } } } });
+            const intervalCtx = document.getElementById('historyIntervalChart').getContext('2d');
+            historyIntervalChart = new Chart(intervalCtx, { type: 'bar', data: { labels: [], datasets: [{ label: 'Intensidade Média (RMS)', data: [], backgroundColor: 'rgba(54, 162, 235, 0.6)' }] }, options: { scales: { y: { beginAtZero: true } } } });
+        }
+        
+        function renderHistoricalData(data) {
+            historyTrendChart.data.labels = data.daily_summary.map(day => day.date);
+            historyTrendChart.data.datasets[0].data = data.daily_summary.map(day => day.avg_rms);
             historyIntervalChart.data.labels = data.interval_summary.map(item => item.label);
             historyIntervalChart.data.datasets[0].data = data.interval_summary.map(item => item.avg_rms);
-            
-            // Atualiza o título do gráfico de intervalo dinamicamente
-            const intervalTitle = document.getElementById('history-interval-chart-title');
             const activeIntervalBtn = document.querySelector('#history-view .scale-btn.active');
-            if (intervalTitle && activeIntervalBtn) {
-                intervalTitle.innerText = `Padrão de Intensidade (a cada ${activeIntervalBtn.innerText.trim()})`;
-            }
-
-            // Atualiza ambos os gráficos
+            document.getElementById('history-interval-chart-title').innerText = `Padrão de Intensidade (a cada ${activeIntervalBtn.innerText.trim()})`;
             historyTrendChart.update();
             historyIntervalChart.update();
         }
 
-        // Função para buscar os dados da API e chamar a renderização
-function fetchAndDisplayHistory() {
-    const patientId = document.getElementById('history-patient-select').value;
-    const startDate = document.getElementById('history-start-date').value;
-    const endDate = document.getElementById('history-end-date').value;
-
-    // <<< ALTERAÇÃO AQUI >>>
-    // 1. Encontra o botão de intervalo que está atualmente selecionado (com a classe 'active')
-    const activeIntervalBtn = document.querySelector('#history-view .scale-btn.active');
-    // 2. Pega o valor do atributo 'data-interval' do botão, ou usa '60' como padrão
-    const interval = activeIntervalBtn ? activeIntervalBtn.dataset.interval : '60';
-
-    if (!patientId) {
-        alert("Por favor, selecione um paciente primeiro.");
-        return;
-    }
-    if (!startDate || !endDate) {
-        alert("Por favor, selecione uma data de início e de fim.");
-        return;
-    }
-
-    // <<< ALTERAÇÃO AQUI >>>
-    // 3. Adiciona o novo parâmetro '&interval=' à URL da requisição
-    const url = `/api/historical_data?patient_id=${patientId}&start_date=${startDate}&end_date=${endDate}&interval=${interval}`;
-    
-    fetch(url)
-        .then(response => response.json())
-        .then(data => {
-            if (data.error) {
-                alert("Erro ao buscar dados: " + data.error);
+        function fetchDateRangeHistory() {
+            const patientId = document.getElementById('history-patient-select').value;
+            const startDate = document.getElementById('history-start-date').value;
+            const endDate = document.getElementById('history-end-date').value;
+            const activeIntervalBtn = document.querySelector('#history-view .scale-btn.active');
+            const interval = activeIntervalBtn ? activeIntervalBtn.dataset.interval : '60';
+            if (!patientId || !startDate || !endDate) {
+                alert("Por favor, selecione um paciente e um intervalo de datas.");
                 return;
             }
-            renderHistoricalData(data);
-        })
-        .catch(err => console.error("Falha na requisição de histórico:", err));
-}
+            const url = `/api/historical_data?patient_id=${patientId}&start_date=${startDate}&end_date=${endDate}&interval=${interval}`;
+            fetch(url).then(response => response.json()).then(data => {
+                if (data.error) {
+                    alert("Erro ao buscar dados: " + data.error);
+                    return;
+                }
+                renderHistoricalData(data);
+            }).catch(err => console.error("Falha na requisição de histórico:", err));
+        }
+
         // --- Lógica Principal de Carregamento e Seleção ---
         function loadStructure(autoSelect = false, patientIdToSelect = null, sessionIdToSelect = null) {
-            const patientSelect = document.getElementById('patient-select');
-            const sessionSelect = document.getElementById('session-select');
-            const selectedPatientId = patientSelect.value;
-            const selectedSessionId = sessionSelect.value;
-            
             fetch('/api/structure').then(r => r.json()).then(data => {
                 allPatientsData = data;
-                populatePatientSelect(selectedPatientId);
-                // <<< ADIÇÃO PARA POPULAR O NOVO DROPDOWN TAMBÉM >>>
+                populatePatientSelect(patientIdToSelect || document.getElementById('patient-select').value);
                 populateHistoryPatientSelect(document.getElementById('history-patient-select').value);
-                
-                if (patientSelect.value) {
-                    const patientData = allPatientsData.find(p => p.id == patientSelect.value);
-                    populateSessionSelect(patientData ? patientData.sessoes : [], selectedSessionId);
+                const currentPatientId = document.getElementById('patient-select').value;
+                if (currentPatientId) {
+                    const patientData = allPatientsData.find(p => p.id == currentPatientId);
+                    populateSessionSelect(patientData ? patientData.sessoes : [], sessionIdToSelect);
                 }
-                
                 if (document.getElementById('archive-mode-panel').style.display === 'block') { populateArchiveList(); }
-
                 if (autoSelect && patientIdToSelect && sessionIdToSelect) {
                     selectActiveSession(patientIdToSelect, sessionIdToSelect);
                 }
@@ -378,108 +467,81 @@ function fetchAndDisplayHistory() {
         }
         
         function loadInitialSessionData(sessionId) {
-        document.getElementById('analysis-content').style.display = 'block';
-
-        magnitudeChart.data.labels = [];
-        magnitudeChart.data.datasets[0].data = [];
-        rawChart.data.labels = [];
-        rawChart.data.datasets[0].data = [];
-        rawChart.data.datasets[1].data = [];
-        rawChart.data.datasets[2].data = [];
-        magnitudeChart.update('none');
-        rawChart.update('none');
-
-        fetch(`/api/initial_session_data?id=${sessionId}`)
-            .then(response => response.json())
-            .then(data => {
-                if (data.error) {
-                    console.error("Erro ao carregar dados iniciais:", data.error);
-                    return;
-                }
-                
+            document.getElementById('analysis-content').style.display = 'block';
+            magnitudeChart.data.labels = [];
+            magnitudeChart.data.datasets[0].data = [];
+            rawChart.data.labels = [];
+            rawChart.data.datasets[0].data = [];
+            rawChart.data.datasets[1].data = [];
+            rawChart.data.datasets[2].data = [];
+            magnitudeChart.update('none');
+            rawChart.update('none');
+            fetch(`/api/initial_session_data?id=${sessionId}`).then(response => response.json()).then(data => {
+                if (data.error) { console.error("Erro:", data.error); return; }
                 if (data.metrics) {
                     document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
                     document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
                     document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
                 }
-
                 if (data.charts && data.charts.labels) {
-                    // <<< ALTERAÇÃO AQUI >>>
-                    // Pega apenas os últimos 'MAX_CHART_POINTS' pontos dos dados recebidos.
                     const labels = data.charts.labels.slice(-MAX_CHART_POINTS);
                     const filteredData = data.charts.sinal_filtrado.slice(-MAX_CHART_POINTS);
                     const xData = data.charts.x.slice(-MAX_CHART_POINTS);
                     const yData = data.charts.y.slice(-MAX_CHART_POINTS);
                     const zData = data.charts.z.slice(-MAX_CHART_POINTS);
-
-                    // Adiciona apenas os dados "cortados" aos gráficos
                     magnitudeChart.data.labels.push(...labels);
                     magnitudeChart.data.datasets[0].data.push(...filteredData);
-
                     rawChart.data.labels.push(...labels);
                     rawChart.data.datasets[0].data.push(...xData);
                     rawChart.data.datasets[1].data.push(...yData);
                     rawChart.data.datasets[2].data.push(...zData);
-                    
                     magnitudeChart.update('none');
                     rawChart.update('none');
                 }
-            })
-            .catch(error => console.error('Falha ao buscar dados iniciais da sessão:', error));
-    }
+            }).catch(error => console.error('Falha:', error));
+        }
         
-// --- Event Listeners da Página ---
+        // --- Event Listeners da Página ---
         document.addEventListener('DOMContentLoaded', () => {
             const analysisContentHTML = `<div class="metrics-grid"><div class="metric"><h3>Freq. Pico</h3><p id="freq-value">0.00 Hz</p></div><div class="metric"><h3>Intensidade (RMS)</h3><p id="rms-value">0.0000</p></div><div class="metric"><h3>Total de Amostras</h3><p id="samples-value">0</p></div></div><div class="scale-controls"><span>Escala (Dados Brutos): </span><button class="scale-btn active" data-scale="auto">Auto</button><button class="scale-btn" data-scale="5">±5</button><button class="scale-btn" data-scale="10">±10</button><button class="scale-btn" data-scale="15">±15</button><button class="scale-btn" data-scale="20">±20</button></div><div class="plot-container"><h3 id="magnitude-chart-title"></h3><canvas id="magnitudeChart"></canvas></div><div class="plot-container"><h3 id="raw-chart-title"></h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>`;
-            
-            // 1. Prepara as áreas de visualização
             document.getElementById('analysis-content').innerHTML = analysisContentHTML;
             initializeCharts();
             initializeHistoryCharts(); 
             updateChartTitles();
-
-            // 2. Busca o estado inicial das sessões ativas
-            fetch('/api/active_sessions')
-                .then(r => r.json())
-                .then(sessions => updateActiveSessionsList(sessions));
+            fetch('/api/active_sessions').then(r => r.json()).then(sessions => updateActiveSessionsList(sessions));
             
-            // 3. Define constantes para os elementos principais da UI
             const viewHistoryBtn = document.getElementById('view-history-btn');
             const backToRealtimeBtn = document.getElementById('back-to-realtime-btn');
             const fetchHistoryBtn = document.getElementById('fetch-history-btn');
             const realtimeView = document.getElementById('analysis-content');
             const historyView = document.getElementById('history-view');
-            const sessionSelector = document.querySelector('.session-selector');
+            const sessionSelector = document.querySelector('.main-content > .session-selector');
 
-            // 4. Adiciona todos os Event Listeners da página
-
-            // <<< ADIÇÃO DO LISTENER PARA OS BOTÕES DE ESCALA DO HISTÓRICO >>>
             document.querySelectorAll('#history-view .scale-btn').forEach(button => {
                 button.addEventListener('click', () => {
-                    // Remove a classe 'active' de todos os botões do grupo
                     document.querySelectorAll('#history-view .scale-btn').forEach(btn => btn.classList.remove('active'));
-                    // Adiciona a classe 'active' apenas no botão clicado
                     button.classList.add('active');
-                    // Chama a função para buscar e redesenhar os dados com o novo intervalo
-                    fetchAndDisplayHistory();
+                    const selectedDay = document.querySelector('.heatmap-day.selected');
+                    if (selectedDay) {
+                        fetchAndDisplayDayDetail(selectedDay.dataset.date);
+                    } else {
+                        fetchDateRangeHistory();
+                    }
                 });
             });
 
-            
-            // Listener para cliques na lista de sessões ativas (delegação de evento)
+            document.getElementById('prev-month-btn').addEventListener('click', () => { currentHistoryDate.setMonth(currentHistoryDate.getMonth() - 1); fetchAndRenderHeatmap(); });
+            document.getElementById('next-month-btn').addEventListener('click', () => { currentHistoryDate.setMonth(currentHistoryDate.getMonth() + 1); fetchAndRenderHeatmap(); });
+            document.getElementById('history-patient-select').addEventListener('change', fetchAndRenderHeatmap);
+            fetchHistoryBtn.addEventListener('click', fetchDateRangeHistory);
+
             document.getElementById('active-sessions-list').addEventListener('click', (event) => {
                 const li = event.target.closest('li');
-                // Garante que o clique foi em um item da lista e não no botão Parar
-                if (li && li.dataset.sessionId && !event.target.matches('button')) {
-                    selectActiveSession(li.dataset.patientId, li.dataset.sessionId);
-                }
+                if (li && !event.target.matches('button')) selectActiveSession(li.dataset.patientId, li.dataset.sessionId);
             });
 
-            // Listeners para os botões de escala dos gráficos
-            // <<< CORREÇÃO: Adicionado '#analysis-content' para especificar a área >>>
             document.querySelectorAll('#analysis-content .scale-btn').forEach(button => {
                 button.addEventListener('click', () => {
-                    // <<< CORREÇÃO: Seletor também foi especificado aqui >>>
                     document.querySelectorAll('#analysis-content .scale-btn').forEach(btn => btn.classList.remove('active'));
                     button.classList.add('active');
                     const scaleValue = button.getAttribute('data-scale');
@@ -497,39 +559,27 @@ function fetchAndDisplayHistory() {
                 });
             });
             
-            // Listener para o dropdown principal de pacientes
             document.getElementById('patient-select').addEventListener('change', function() {
-                const patientId = this.value;
-                const patientData = allPatientsData.find(p => p.id == patientId);
+                const patientData = allPatientsData.find(p => p.id == this.value);
                 populateSessionSelect(patientData ? patientData.sessoes : []);
                 document.getElementById('analysis-content').style.display = 'none';
-                
-                // Habilita ou desabilita o botão de histórico
-                //viewHistoryBtn.disabled = !this.value;
-
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
                     currentSessionId = null;
                 }
             });
             
-            // Listener para o dropdown de sessões
             document.getElementById('session-select').addEventListener('change', function() {
+                if (currentSessionId) socket.emit('unsubscribe_from_session', { id: currentSessionId });
+                currentSessionId = this.value;
                 if (currentSessionId) {
-                    socket.emit('unsubscribe_from_session', { id: currentSessionId });
-                }
-                const newSessionId = this.value;
-                currentSessionId = newSessionId;
-
-                if (newSessionId) {
-                    loadInitialSessionData(newSessionId);
-                    socket.emit('subscribe_to_session', { id: newSessionId });
+                    loadInitialSessionData(currentSessionId);
+                    socket.emit('subscribe_to_session', { id: currentSessionId });
                 } else {
                     document.getElementById('analysis-content').style.display = 'none';
                 }
             });
 
-            // Listeners para a nova tela de histórico
             viewHistoryBtn.addEventListener('click', () => {
                 const currentPatientId = document.getElementById('patient-select').value;
                 if (currentPatientId) {
@@ -540,27 +590,21 @@ function fetchAndDisplayHistory() {
                 historyView.style.display = 'block';
                 const endDateInput = document.getElementById('history-end-date');
                 const startDateInput = document.getElementById('history-start-date');
-                if (!endDateInput.value) {
-                    endDateInput.valueAsDate = new Date();
-                }
+                if (!endDateInput.value) endDateInput.valueAsDate = new Date();
                 if (!startDateInput.value) {
                     let thirtyDaysAgo = new Date();
                     thirtyDaysAgo.setDate(thirtyDaysAgo.getDate() - 30);
                     startDateInput.valueAsDate = thirtyDaysAgo;
                 }
+                fetchAndRenderHeatmap();
             });
 
             backToRealtimeBtn.addEventListener('click', () => {
                 historyView.style.display = 'none';
                 sessionSelector.style.display = 'flex';
-                if (currentSessionId) {
-                    realtimeView.style.display = 'block';
-                }
+                if (currentSessionId) realtimeView.style.display = 'block';
             });
             
-            fetchHistoryBtn.addEventListener('click', fetchAndDisplayHistory);
-
-            // Listeners do painel de gerenciamento
             document.getElementById('toggle-archive-mode-btn').addEventListener('click', () => toggleArchiveMode(true));
             document.getElementById('cancel-archive-btn').addEventListener('click', () => toggleArchiveMode(false));
             document.getElementById('delete-patient-list').addEventListener('click', handleArchiveSelection);
@@ -568,94 +612,47 @@ function fetchAndDisplayHistory() {
             document.getElementById('show-archived-btn').addEventListener('click', showArchivedModal);
             document.getElementById('modal-close-btn').addEventListener('click', () => document.getElementById('archived-modal').style.display = 'none');
             
-            // 5. Carrega a estrutura inicial da página
             loadStructure();
         });
 
         function updatePatientList(patients) {
             const list = document.getElementById("patient-list");
-            list.innerHTML = ""; // Limpa a lista
-
+            list.innerHTML = "";
             if (!patients || patients.length === 0) {
                 list.innerHTML = '<li style="color: #888;">Nenhum paciente online.</li>';
                 return;
             }
-
             patients.forEach(patientName => {
                 const li = document.createElement("li");
-                
-                // Verifica se o paciente da lista "Online" também está na lista "Ativa"
                 const isPatientActive = activePatientNames.has(patientName);
-
-                // Monta o HTML do botão baseado no estado do paciente (ativo ou não)
-                const buttonHtml = isPatientActive
-                    ? `<button class="control-btn start-btn" disabled>Iniciada</button>` // Botão desabilitado se a sessão já começou
-                    : `<button class="control-btn start-btn" onclick="start('${patientName}')">Iniciar</button>`; // Botão normal para iniciar
-
-                // Define o conteúdo do item da lista
-                li.innerHTML = `
-                    <span>
-                        <span class="status-dot"></span>
-                        ${patientName}
-                    </span>
-                    <div>
-                        ${buttonHtml}
-                    </div>
-                `;
+                const buttonHtml = isPatientActive ? `<button class="control-btn start-btn" disabled>Iniciada</button>` : `<button class="control-btn start-btn" onclick="start('${patientName}')">Iniciar</button>`;
+                li.innerHTML = `<span><span class="status-dot"></span> ${patientName}</span><div>${buttonHtml}</div>`;
                 list.appendChild(li);
             });
         }
 
-        function start(t) {
-            fetch("/api/start_session", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ patientId: t })
-            });
-        }
-
-        function stop(t) {
-            fetch("/api/stop_session", {
-                method: "POST",
-                headers: { "Content-Type": "application/json" },
-                body: JSON.stringify({ patientId: t })
-            });
-        }
-
+        function start(t) { fetch("/api/start_session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ patientId: t }) }); }
+        function stop(t) { fetch("/api/stop_session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ patientId: t }) }); }
         function toggleArchiveMode(t) {
-            const e = document.getElementById("archive-mode-panel"),
-                n = [document.getElementById("toggle-archive-mode-btn"), document.getElementById("show-archived-btn")];
+            const e = document.getElementById("archive-mode-panel"), n = [document.getElementById("toggle-archive-mode-btn"), document.getElementById("show-archived-btn")];
             n.forEach(e => e.style.display = t ? "none" : "inline-block");
-            if (t) {
-                populateArchiveList();
-                e.style.display = "block";
-            } else {
-                e.style.display = "none";
-                selectedForArchiving.clear();
-            }
+            if (t) { populateArchiveList(); e.style.display = "block"; } else { e.style.display = "none"; selectedForArchiving.clear(); }
         }
-
-        // <<< ADIÇÃO DA NOVA FUNÇÃO PARA POPULAR O DROPDOWN DE HISTÓRICO >>>
         function populateHistoryPatientSelect(keepSelectedId) {
             const select = document.getElementById("history-patient-select");
-            select.innerHTML = '<option value="">-- Selecione um Paciente --</option>';
+            const currentValue = keepSelectedId || select.value;
+            select.innerHTML = '<option value="">-- Selecione --</option>';
             allPatientsData.forEach(patient => {
                 const option = document.createElement("option");
-                option.value = patient.id;
-                option.textContent = patient.nome; // Usando o nome formatado que vem do servidor
-                select.appendChild(option);
+                option.value = patient.id; option.textContent = patient.nome; select.appendChild(option);
             });
-            if (keepSelectedId && allPatientsData.some(p => p.id == keepSelectedId)) {
-                select.value = keepSelectedId;
-            }
+            if (currentValue && allPatientsData.some(p => p.id == currentValue)) select.value = currentValue;
         }
-
         function populateArchiveList() {
             const t = document.getElementById("delete-patient-list");
             t.innerHTML = "";
             allPatientsData.forEach(e => {
-                const n = e.sessoes.length,
-                    o = document.createElement("li");
+                const n = e.sessoes.length, o = document.createElement("li");
                 o.innerHTML = `<label style="display: flex; align-items: center; width: 100%; cursor: pointer;"><input type="checkbox" data-id="${e.id}" style="margin-right: 10px;" /><span>${e.nome} (${n} sessões)</span></label>`;
                 t.appendChild(o);
             });
@@ -667,57 +664,11 @@ function fetchAndDisplayHistory() {
         function populatePatientSelect(t){const e=document.getElementById("patient-select");e.innerHTML='<option value="">-- Selecione um Paciente --</option>',allPatientsData.forEach(t=>{const n=document.createElement("option");n.value=t.id,n.textContent=t.nome,e.appendChild(n)}),t&&allPatientsData.some(e=>e.id==t)&&(e.value=t)}
         function populateSessionSelect(t,e){const n=document.getElementById("session-select");if(n.innerHTML='<option value="">-- Selecione uma Sessão --</option>',t&&0<t.length){t.forEach(e=>{const t=document.createElement("option");t.value=e.id;try{t.textContent=`Sessão de ${new Date(e.timestamp).toLocaleString("pt-BR")}`}catch(e){t.textContent=e.id}n.appendChild(t)}),n.disabled=!1,e&&t.some(t=>t.id==e)&&(n.value=e)}else n.disabled=!0}
         function initializeCharts() {
-    const t = document.getElementById("magnitudeChart").getContext("2d");
-    magnitudeChart = new Chart(t, {
-        type: "line",
-        data: { labels: [], datasets: [{ label: "Sinal de Tremor (Filtrado)", data: [], borderColor: "rgba(90, 90, 158, 1)", borderWidth: 1, pointRadius: 0 }] },
-        options: {
-            animation: false,
-            responsive: true,
-            maintainAspectRatio: true,
-            scales: {
-                x: {
-                    ticks: {
-                        // <<< ALTERAÇÕES AQUI >>>
-                        autoSkip: true,
-                        maxTicksLimit: 8,
-
-                        callback: function(value, index, values) {
-                            const timestamp = this.getLabelForValue(value);
-                            const date = new Date(Number(timestamp));
-                            return date.toLocaleTimeString('pt-BR');
-                        }
-                    }
-                }
-            }
+            const t = document.getElementById("magnitudeChart").getContext("2d");
+            magnitudeChart = new Chart(t, { type: "line", data: { labels: [], datasets: [{ label: "Sinal de Tremor (Filtrado)", data: [], borderColor: "rgba(90, 90, 158, 1)", borderWidth: 1, pointRadius: 0 }] }, options: { animation: false, responsive: true, maintainAspectRatio: true, scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 8, callback: function(value) { const timestamp = this.getLabelForValue(value); return new Date(Number(timestamp)).toLocaleTimeString('pt-BR'); } } } } } });
+            const e = document.getElementById("rawChart").getContext("2d");
+            rawChart = new Chart(e, { type: "line", data: { labels: [], datasets: [{ label: "Eixo X", data: [], borderColor: "rgba(255, 99, 132, 1)", borderWidth: 1, pointRadius: 0 }, { label: "Eixo Y", data: [], borderColor: "rgba(75, 192, 192, 1)", borderWidth: 1, pointRadius: 0 }, { label: "Eixo Z", data: [], borderColor: "rgba(54, 162, 235, 1)", borderWidth: 1, pointRadius: 0 }] }, options: { animation: false, responsive: true, maintainAspectRatio: true, scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 8, callback: function(value) { const timestamp = this.getLabelForValue(value); return new Date(Number(timestamp)).toLocaleTimeString('pt-BR'); } } } } } });
         }
-    });
-    const e = document.getElementById("rawChart").getContext("2d");
-    rawChart = new Chart(e, {
-        type: "line",
-        data: { labels: [], datasets: [{ label: "Eixo X", data: [], borderColor: "rgba(255, 99, 132, 1)", borderWidth: 1, pointRadius: 0 }, { label: "Eixo Y", data: [], borderColor: "rgba(75, 192, 192, 1)", borderWidth: 1, pointRadius: 0 }, { label: "Eixo Z", data: [], borderColor: "rgba(54, 162, 235, 1)", borderWidth: 1, pointRadius: 0 }] },
-        options: {
-            animation: false,
-            responsive: true,
-            maintainAspectRatio: true,
-            scales: {
-                x: {
-                    ticks: {
-                        // <<< ALTERAÇÕES AQUI >>>
-                        autoSkip: true,
-                        maxTicksLimit: 8,
-
-                        callback: function(value, index, values) {
-                            const timestamp = this.getLabelForValue(value);
-                            const date = new Date(Number(timestamp));
-                            return date.toLocaleTimeString('pt-BR');
-                        }
-                    }
-                }
-            }
-        }
-    });
-}
     </script>
 </body>
 </html>
