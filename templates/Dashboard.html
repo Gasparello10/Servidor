@@ -112,8 +112,16 @@
                 </div>
 
                 <div class="plot-container">
-                    <h3>Padrão de Intensidade por Hora do Dia</h3>
-                    <canvas id="historyHourlyChart"></canvas>
+                    <div class="scale-controls">
+                        <span>Analisar a cada:</span>
+                        <button class="scale-btn active" data-interval="60">60 min</button>
+                        <button class="scale-btn" data-interval="30">30 min</button>
+                        <button class="scale-btn" data-interval="10">10 min</button>
+                        <button class="scale-btn" data-interval="5">5 min</button>
+                        <button class="scale-btn" data-interval="2">2 min</button>
+                    </div>
+                    <h3 id="history-interval-chart-title">Padrão de Intensidade por Intervalo</h3>
+                    <canvas id="historyIntervalChart"></canvas>
                 </div>
                  <div style="text-align: center; margin-top: 20px;">
                     <button id="back-to-realtime-btn" class="action-btn" style="background-color: #6c757d;">Voltar para Tempo Real</button>
@@ -135,7 +143,7 @@
         let allPatientsData = [];
         let selectedForArchiving = new Set();
         let magnitudeChart, rawChart;
-        let historyTrendChart, historyHourlyChart;
+        let historyTrendChart, historyIntervalChart;
 
         const MAX_CHART_POINTS = 200;    //Configuração: Limite máximo de pontos no gráfico
 
@@ -259,73 +267,90 @@
         // <<< ADIÇÃO DE TODO O BLOCO DE NOVAS FUNÇÕES DE HISTÓRICO >>>
 
         // Função para inicializar os gráficos de histórico (vazios)
-        function initializeHistoryCharts() {
-            const trendCtx = document.getElementById('historyTrendChart').getContext('2d');
-            historyTrendChart = new Chart(trendCtx, {
-                type: 'line',
-                data: { labels: [], datasets: [{ label: 'Intensidade Média (RMS)', data: [], borderColor: 'rgba(255, 159, 64, 1)', tension: 0.1 }] },
-                options: { scales: { y: { beginAtZero: true } } }
-            });
+function initializeHistoryCharts() {
+    const trendCtx = document.getElementById('historyTrendChart').getContext('2d');
+    historyTrendChart = new Chart(trendCtx, {
+        type: 'line',
+        data: { labels: [], datasets: [{ label: 'Intensidade Média (RMS)', data: [], borderColor: 'rgba(255, 159, 64, 1)', tension: 0.1 }] },
+        options: { scales: { y: { beginAtZero: true } } }
+    });
 
-            const hourlyCtx = document.getElementById('historyHourlyChart').getContext('2d');
-            historyHourlyChart = new Chart(hourlyCtx, {
-                type: 'bar',
-                data: { labels: Array.from({length: 24}, (_, i) => `${i}:00`), datasets: [{ label: 'Intensidade Média (RMS)', data: [], backgroundColor: 'rgba(54, 162, 235, 0.6)' }] },
-                options: { scales: { y: { beginAtZero: true } } }
-            });
-        }
-
+    // <<< ALTERAÇÕES AQUI >>>
+    // 1. Aponta para o novo ID do canvas: 'historyIntervalChart'
+    const intervalCtx = document.getElementById('historyIntervalChart').getContext('2d');
+    // 2. Usa a nova variável: 'historyIntervalChart'
+    historyIntervalChart = new Chart(intervalCtx, {
+        type: 'bar',
+        // Os 'labels' e 'data' começam vazios, pois serão preenchidos dinamicamente
+        data: { labels: [], datasets: [{ label: 'Intensidade Média (RMS)', data: [], backgroundColor: 'rgba(54, 162, 235, 0.6)' }] },
+        options: { scales: { y: { beginAtZero: true } } }
+    });
+}
         // Função para preencher os gráficos com os dados da API
         function renderHistoricalData(data) {
-            // Limpa dados antigos
+            // Limpa dados antigos do gráfico de tendência
             historyTrendChart.data.labels = [];
             historyTrendChart.data.datasets[0].data = [];
-            historyHourlyChart.data.datasets[0].data = Array(24).fill(0); // Garante que todas as horas estejam presentes
 
-            // Preenche o gráfico de tendência diária
+            // Preenche o gráfico de tendência diária (nenhuma mudança aqui)
             data.daily_summary.forEach(day => {
                 historyTrendChart.data.labels.push(day.date);
                 historyTrendChart.data.datasets[0].data.push(day.avg_rms);
             });
 
-            // Preenche o gráfico de padrão por hora
-            data.hourly_summary.forEach(hourInfo => {
-                historyHourlyChart.data.datasets[0].data[hourInfo.hour] = hourInfo.avg_rms;
-            });
+            // <<< ALTERAÇÕES AQUI >>>
+            // Limpa e preenche o gráfico de padrão por intervalo com os novos dados
+            historyIntervalChart.data.labels = data.interval_summary.map(item => item.label);
+            historyIntervalChart.data.datasets[0].data = data.interval_summary.map(item => item.avg_rms);
+            
+            // Atualiza o título do gráfico de intervalo dinamicamente
+            const intervalTitle = document.getElementById('history-interval-chart-title');
+            const activeIntervalBtn = document.querySelector('#history-view .scale-btn.active');
+            if (intervalTitle && activeIntervalBtn) {
+                intervalTitle.innerText = `Padrão de Intensidade (a cada ${activeIntervalBtn.innerText.trim()})`;
+            }
 
+            // Atualiza ambos os gráficos
             historyTrendChart.update();
-            historyHourlyChart.update();
+            historyIntervalChart.update();
         }
 
         // Função para buscar os dados da API e chamar a renderização
-        function fetchAndDisplayHistory() {
-            const patientId = document.getElementById('history-patient-select').value;
-            const startDate = document.getElementById('history-start-date').value;
-            const endDate = document.getElementById('history-end-date').value;
+function fetchAndDisplayHistory() {
+    const patientId = document.getElementById('history-patient-select').value;
+    const startDate = document.getElementById('history-start-date').value;
+    const endDate = document.getElementById('history-end-date').value;
 
-            if (!patientId) {
-                alert("Por favor, selecione um paciente primeiro.");
+    // <<< ALTERAÇÃO AQUI >>>
+    // 1. Encontra o botão de intervalo que está atualmente selecionado (com a classe 'active')
+    const activeIntervalBtn = document.querySelector('#history-view .scale-btn.active');
+    // 2. Pega o valor do atributo 'data-interval' do botão, ou usa '60' como padrão
+    const interval = activeIntervalBtn ? activeIntervalBtn.dataset.interval : '60';
+
+    if (!patientId) {
+        alert("Por favor, selecione um paciente primeiro.");
+        return;
+    }
+    if (!startDate || !endDate) {
+        alert("Por favor, selecione uma data de início e de fim.");
+        return;
+    }
+
+    // <<< ALTERAÇÃO AQUI >>>
+    // 3. Adiciona o novo parâmetro '&interval=' à URL da requisição
+    const url = `/api/historical_data?patient_id=${patientId}&start_date=${startDate}&end_date=${endDate}&interval=${interval}`;
+    
+    fetch(url)
+        .then(response => response.json())
+        .then(data => {
+            if (data.error) {
+                alert("Erro ao buscar dados: " + data.error);
                 return;
             }
-            if (!startDate || !endDate) {
-                alert("Por favor, selecione uma data de início e de fim.");
-                return;
-            }
-
-            const url = `/api/historical_data?patient_id=${patientId}&start_date=${startDate}&end_date=${endDate}`;
-            
-            fetch(url)
-                .then(response => response.json())
-                .then(data => {
-                    if (data.error) {
-                        alert("Erro ao buscar dados: " + data.error);
-                        return;
-                    }
-                    renderHistoricalData(data);
-                })
-                .catch(err => console.error("Falha na requisição de histórico:", err));
-        }
-
+            renderHistoricalData(data);
+        })
+        .catch(err => console.error("Falha na requisição de histórico:", err));
+}
         // --- Lógica Principal de Carregamento e Seleção ---
         function loadStructure(autoSelect = false, patientIdToSelect = null, sessionIdToSelect = null) {
             const patientSelect = document.getElementById('patient-select');
@@ -427,6 +452,19 @@
             const sessionSelector = document.querySelector('.session-selector');
 
             // 4. Adiciona todos os Event Listeners da página
+
+            // <<< ADIÇÃO DO LISTENER PARA OS BOTÕES DE ESCALA DO HISTÓRICO >>>
+            document.querySelectorAll('#history-view .scale-btn').forEach(button => {
+                button.addEventListener('click', () => {
+                    // Remove a classe 'active' de todos os botões do grupo
+                    document.querySelectorAll('#history-view .scale-btn').forEach(btn => btn.classList.remove('active'));
+                    // Adiciona a classe 'active' apenas no botão clicado
+                    button.classList.add('active');
+                    // Chama a função para buscar e redesenhar os dados com o novo intervalo
+                    fetchAndDisplayHistory();
+                });
+            });
+
             
             // Listener para cliques na lista de sessões ativas (delegação de evento)
             document.getElementById('active-sessions-list').addEventListener('click', (event) => {

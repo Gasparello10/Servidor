@@ -10,6 +10,7 @@ from collections import defaultdict
 import logging
 import pyodbc
 from datetime import datetime, timedelta
+import math 
 
 # ==========================
 # CONFIGURAÇÕES GLOBAIS
@@ -230,18 +231,22 @@ def get_archived_patients():
     finally: conn.close()
 
 
-from datetime import datetime, timedelta
-
 @app.route('/api/historical_data')
 def get_historical_data():
     patient_id = request.args.get('patient_id')
     end_date_str = request.args.get('end_date', datetime.utcnow().strftime('%Y%m%d'))
     start_date_str = request.args.get('start_date', (datetime.utcnow() - timedelta(days=30)).strftime('%Y%m%d'))
+    
+    try:
+        interval_minutes = int(request.args.get('interval', '60'))
+        if interval_minutes not in [2, 5, 10, 30, 60]:
+            return jsonify({"error": "Intervalo inválido."}), 400
+    except ValueError:
+        return jsonify({"error": "Intervalo deve ser um número."}), 400
 
     if not patient_id:
         return jsonify({"error": "ID do paciente não fornecido"}), 400
-    
-    # Garante que as datas estejam no formato AAAAMMDD, removendo hífens se existirem.
+
     start_date_for_sql = start_date_str.replace('-', '')
     end_date_for_sql = end_date_str.replace('-', '')
 
@@ -252,48 +257,58 @@ def get_historical_data():
     cursor = conn.cursor()
     response_data = {
         "daily_summary": [],
-        "hourly_summary": []
+        "interval_summary": []
     }
 
     try:
-        # Query para o resumo diário (gráfico de tendência)
+        # Query para o resumo diário (sem alterações)
         sql_daily = """
-            SELECT
-                CONVERT(date, aj.timestamp_janela) AS dia,
-                AVG(aj.intensidade_rms) AS media_rms,
-                MAX(aj.intensidade_rms) AS max_rms,
-                AVG(aj.freq_pico) AS media_freq
-            FROM analises_janela aj
-            JOIN sessoes s ON aj.sessao_id = s.id
-            WHERE s.paciente_id = ?
-              AND aj.timestamp_janela >= ? AND aj.timestamp_janela < DATEADD(day, 1, ?)
-            GROUP BY CONVERT(date, aj.timestamp_janela)
-            ORDER BY dia;
+            SELECT CONVERT(date, aj.timestamp_janela) AS dia, AVG(aj.intensidade_rms) AS media_rms, MAX(aj.intensidade_rms) AS max_rms, AVG(aj.freq_pico) AS media_freq
+            FROM analises_janela aj JOIN sessoes s ON aj.sessao_id = s.id
+            WHERE s.paciente_id = ? AND aj.timestamp_janela >= ? AND aj.timestamp_janela < DATEADD(day, 1, ?)
+            GROUP BY CONVERT(date, aj.timestamp_janela) ORDER BY dia;
         """
         cursor.execute(sql_daily, int(patient_id), start_date_for_sql, end_date_for_sql)
         for row in cursor.fetchall():
             response_data["daily_summary"].append({
-                "date": row.dia.strftime('%Y-%m-%d'),
-                "avg_rms": row.media_rms,
-                "max_rms": row.max_rms,
-                "avg_freq": row.media_freq
+                "date": row.dia.strftime('%Y-%m-%d'), "avg_rms": row.media_rms,
+                "max_rms": row.max_rms, "avg_freq": row.media_freq
             })
 
-        # Query para o resumo por hora (padrão de ocorrência)
-        sql_hourly = """
+        # <<< CORREÇÃO AQUI: A query de intervalo foi reescrita com um CTE >>>
+        sql_interval = """
+            WITH TimeBuckets AS (
+                SELECT
+                    aj.intensidade_rms,
+                    (DATEDIFF(minute, CONVERT(date, aj.timestamp_janela), aj.timestamp_janela) / ?) AS bucket_index
+                FROM analises_janela aj
+                JOIN sessoes s ON aj.sessao_id = s.id
+                WHERE s.paciente_id = ? AND aj.timestamp_janela >= ? AND aj.timestamp_janela < DATEADD(day, 1, ?)
+            )
             SELECT
-                DATEPART(hour, aj.timestamp_janela) AS hora,
-                AVG(aj.intensidade_rms) AS media_rms
-            FROM analises_janela aj
-            JOIN sessoes s ON aj.sessao_id = s.id
-            WHERE s.paciente_id = ?
-              AND aj.timestamp_janela >= ? AND aj.timestamp_janela < DATEADD(day, 1, ?)
-            GROUP BY DATEPART(hour, aj.timestamp_janela)
-            ORDER BY hora;
+                bucket_index AS time_bucket,
+                AVG(intensidade_rms) AS media_rms
+            FROM TimeBuckets
+            GROUP BY bucket_index
+            ORDER BY time_bucket;
         """
-        cursor.execute(sql_hourly, int(patient_id), start_date_for_sql, end_date_for_sql)
-        hourly_map = {row.hora: row.media_rms for row in cursor.fetchall()}
-        response_data["hourly_summary"] = [{"hour": h, "avg_rms": hourly_map.get(h, 0)} for h in range(24)]
+        # Note que 'interval_minutes' agora é passado apenas uma vez
+        cursor.execute(sql_interval, interval_minutes, int(patient_id), start_date_for_sql, end_date_for_sql)
+        
+        total_buckets = (24 * 60) // interval_minutes
+        interval_map = {row.time_bucket: row.media_rms for row in cursor.fetchall()}
+        
+        final_interval_list = []
+        for i in range(total_buckets):
+            hour = (i * interval_minutes) // 60
+            minute = (i * interval_minutes) % 60
+            label = f"{hour:02d}:{minute:02d}"
+            final_interval_list.append({
+                "label": label,
+                "avg_rms": interval_map.get(i, 0)
+            })
+        
+        response_data["interval_summary"] = final_interval_list
         
         return jsonify(response_data)
 
@@ -302,7 +317,6 @@ def get_historical_data():
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
-
 
 @app.route('/api/archive_patient', methods=['POST'])
 def archive_patient():
