@@ -476,9 +476,11 @@ function fetchAndDisplayHistory() {
             });
 
             // Listeners para os botões de escala dos gráficos
-            document.querySelectorAll('.scale-btn').forEach(button => {
+            // <<< CORREÇÃO: Adicionado '#analysis-content' para especificar a área >>>
+            document.querySelectorAll('#analysis-content .scale-btn').forEach(button => {
                 button.addEventListener('click', () => {
-                    document.querySelectorAll('.scale-btn').forEach(btn => btn.classList.remove('active'));
+                    // <<< CORREÇÃO: Seletor também foi especificado aqui >>>
+                    document.querySelectorAll('#analysis-content .scale-btn').forEach(btn => btn.classList.remove('active'));
                     button.classList.add('active');
                     const scaleValue = button.getAttribute('data-scale');
                     if (rawChart) {
