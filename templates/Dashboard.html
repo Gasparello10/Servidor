@@ -600,18 +600,37 @@
             loadStructure();
         });
 
-        function updatePatientList(patients) {
+        function updatePatientList(patientObjects) {
             const list = document.getElementById("patient-list");
             list.innerHTML = "";
-            if (!patients || patients.length === 0) {
+            if (!patientObjects || patientObjects.length === 0) {
                 list.innerHTML = '<li style="color: #888;">Nenhum paciente online.</li>';
                 return;
             }
-            patients.forEach(patientName => {
+            
+            patientObjects.forEach(patient => {
                 const li = document.createElement("li");
+                const patientName = patient.name;
+                const batteryLevel = patient.battery;
                 const isPatientActive = activePatientNames.has(patientName);
-                const buttonHtml = isPatientActive ? `<button class="control-btn start-btn" disabled>Iniciada</button>` : `<button class="control-btn start-btn" onclick="start('${patientName}')">Iniciar</button>`;
-                li.innerHTML = `<span><span class="status-dot"></span> ${patientName}</span><div>${buttonHtml}</div>`;
+
+                const batteryText = batteryLevel ? `🔋 ${batteryLevel}%` : '🔋 --%';
+                const patientInfoHtml = `
+                    <span>
+                        <span class="status-dot"></span>
+                        ${patientName}
+                        <span style="margin-left: 8px; color: #555; font-size: 0.9em;">${batteryText}</span>
+                    </span>
+                `;
+                
+                // <<< CORREÇÃO AQUI >>>
+                // Agora, se a sessão estiver ativa, não mostramos nenhum botão aqui.
+                // O botão de "Parar" já aparece na lista de "Sessões Ativas".
+                const buttonHtml = isPatientActive 
+                    ? `<span style="font-size: 0.9em; color: green;">Em sessão...</span>` // Apenas mostra um status
+                    : `<button class="control-btn start-btn" onclick="start('${patientName}')">Iniciar</button>`;
+
+                li.innerHTML = `${patientInfoHtml}<div>${buttonHtml}</div>`;
                 list.appendChild(li);
             });
         }

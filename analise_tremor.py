@@ -179,11 +179,18 @@ def process_and_push_update(session_id, novas_leituras):
             conn.close()
 
 
-# <<< NOVO: Função centralizada para enviar o estado completo para os dashboards >>>
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
+    # Transforma o dicionário complexo em uma lista simples para o frontend
+    online_patients_list = []
+    for name, data in connected_clients.items():
+        online_patients_list.append({
+            'name': name,
+            'battery': data.get('battery') # Adiciona o nível da bateria
+        })
+
     state_payload = {
-        'online_patients': list(connected_clients.keys()),
+        'online_patients': online_patients_list, # Envia a lista de objetos
         'active_sessions': list(active_sessions.values())
     }
     socketio.emit('state_update', state_payload, room='dashboards')
@@ -515,18 +522,27 @@ def initial_session_data():
         conn.close()
 
         
+# No seu arquivo app.py
+
 @app.route('/api/start_session', methods=['POST'])
 def start_session():
     data = request.get_json()
     patient_name_raw = data.get('patientId')
     if not patient_name_raw: return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
     
-    # <<< CORRIGIDO >>> Variáveis definidas corretamente no início da função.
     patient_name_for_dict = patient_name_raw
     patient_name_for_db = patient_name_raw.replace(" ", "_").lower()
 
-    sid = connected_clients.get(patient_name_for_dict)
-    if not sid: return jsonify({"status": "erro", "message": "Paciente não conectado."}), 404
+    # <<< CORREÇÃO PRINCIPAL AQUI >>>
+    # Pega o objeto de dados do cliente, não apenas o sid
+    client_data = connected_clients.get(patient_name_for_dict)
+    if not client_data: 
+        return jsonify({"status": "erro", "message": "Paciente não conectado via WebSocket."}), 404
+    
+    # Extrai o sid de dentro do objeto
+    sid = client_data.get('sid')
+    if not sid:
+        return jsonify({"status": "erro", "message": "SID do paciente não encontrado."}), 500
     
     conn = get_db_connection()
     if not conn: return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
@@ -551,7 +567,9 @@ def start_session():
             'patient_name': patient_name_for_dict
         }
         
+        # Agora estamos usando a variável 'sid' correta (uma string)
         socketio.emit('start_monitoring', {'sessao_id': nova_sessao_id}, room=sid)
+        
         socketio.emit('session_started', {'patientId': paciente_id, 'sessionId': nova_sessao_id}, room='dashboards')
         emit_state_update()
 
@@ -568,25 +586,30 @@ def stop_session():
     if not patient_id: 
         return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
     
-    sid = connected_clients.get(patient_id)
-    if sid:
-        # 1. Envia o comando para o celular parar de monitorar
-        socketio.emit('stop_monitoring', room=sid)
-        print(f"Comando 'stop' enviado para o paciente: {patient_id}")
-
-        # 2. Modifica o estado no servidor
-        if patient_id in active_sessions:
-            del active_sessions[patient_id]
-            print(f"Sessão do paciente '{patient_id}' removida da lista de ativas.")
-
-        # 3. Notifica os dashboards sobre a mudança de estado E estrutura
-        emit_state_update()
-        socketio.emit('structure_changed')
-        
-        return jsonify({"status": "sucesso", "message": "Comando de parada enviado."})
-    else: 
+    # <<< CORREÇÃO PRINCIPAL AQUI >>>
+    # Pega o objeto de dados do cliente para extrair o sid
+    client_data = connected_clients.get(patient_id)
+    if not client_data:
         return jsonify({"status": "erro", "message": "Paciente não conectado."}), 404
+        
+    sid = client_data.get('sid')
+    if not sid:
+        return jsonify({"status": "erro", "message": "SID do paciente não encontrado."}), 500
+
+    # 1. Envia o comando para o celular parar de monitorar usando o 'sid' correto
+    socketio.emit('stop_monitoring', room=sid)
+    print(f"Comando 'stop' enviado para o paciente: {patient_id}")
+
+    # 2. Modifica o estado no servidor
+    if patient_id in active_sessions:
+        del active_sessions[patient_id]
+        print(f"Sessão do paciente '{patient_id}' removida da lista de ativas.")
+
+    # 3. Notifica os dashboards sobre a mudança de estado E estrutura
+    emit_state_update()
+    socketio.emit('structure_changed')
     
+    return jsonify({"status": "sucesso", "message": "Comando de parada enviado."})
 
 # =============================================================
 # <<< ALTERAÇÃO: Novos handlers para inscrição nos canais da sessão >>>
@@ -618,32 +641,49 @@ def handle_join_dashboard():
 def handle_register(data):
     patient_id = data.get('patientId')
     if patient_id:
-        connected_clients[patient_id] = request.sid
+        # Armazena o sid e um valor inicial para a bateria
+        connected_clients[patient_id] = {'sid': request.sid, 'battery': None}
         print(f"Paciente '{patient_id}' registrado com SID: {request.sid}")
         emit_state_update()
+
+@socketio.on('watch_status_update')
+def handle_watch_status(data):
+    patient_id = data.get('patientId')
+    battery_level = data.get('batteryLevel')
+
+    if patient_id and patient_id in connected_clients:
+        # Atualiza o nível da bateria do paciente
+        connected_clients[patient_id]['battery'] = battery_level
+        print(f"Status do relógio recebido de '{patient_id}': Bateria {battery_level}%")
+        # Envia o estado atualizado para todos os dashboards
+        emit_state_update()
+
 
 @socketio.on('disconnect')
 def handle_disconnect():
     print(f"Cliente desconectado: {request.sid}")
     disconnected_patient = None
-    for patient, sid in list(connected_clients.items()):
-        if sid == request.sid:
-            disconnected_patient = patient
+    for patient_name, client_data in list(connected_clients.items()):
+        if client_data['sid'] == request.sid:
+            disconnected_patient = patient_name
             break
     
     if disconnected_patient:
-        # Remove o paciente da lista de conectados
+        # Apenas remove o paciente da lista de online.
+        # Não tentamos mais adivinhar se a sessão deve parar.
+        # A parada de sessão agora é um evento explícito.
         del connected_clients[disconnected_patient]
-        print(f"Paciente '{disconnected_patient}' desconectado.")
+        print(f"Paciente '{disconnected_patient}' removido da lista de online.")
 
-        # Remove a sessão (se existir) da lista de ativas
+        # Se por acaso o paciente que desconectou era o que estava na sessão ativa,
+        # removemos ele da lista de ativos para a UI ficar correta.
         if disconnected_patient in active_sessions:
             del active_sessions[disconnected_patient]
             print(f"Sessão do paciente desconectado '{disconnected_patient}' removida da lista de ativas.")
 
-        # Envia uma única atualização de estado completa para todos os dashboards.
+        # Atualiza o estado para todos os dashboards.
         emit_state_update()
-
+        
 # <<< NOVO >>> Handler para quando o cliente (celular) informa que a sessão parou.
 @socketio.on('session_stopped_by_client')
 def handle_session_stopped(data):
