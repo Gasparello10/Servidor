@@ -31,7 +31,7 @@ TEMPO_REQUISICAO_MS = 500 # Intervalo entre atualizações no dashboard (ms) - A
 # --- Configurações de banco de dados ---
 CONN_STR = (
     r'DRIVER={ODBC Driver 17 for SQL Server};'
-    r'SERVER=localhost;'
+    r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
     r'DATABASE=AnaliseTremorDB;'
     r'Trusted_Connection=yes;'
 )

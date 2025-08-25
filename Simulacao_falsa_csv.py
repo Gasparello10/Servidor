@@ -3,7 +3,7 @@ import numpy as np
 import time
 
 # --- Parâmetros da Simulação ---
-DURACAO_MINUTOS = 600
+DURACAO_MINUTOS = 60
 TAXA_AMOSTRAGEM_HZ = 50
 FREQUENCIA_SINAL_HZ = 6.0
 AMPLITUDE_SINAL = 15.0
