@@ -422,9 +422,6 @@ def restore_patient():
     except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
     finally: conn.close()
 
-# =========================================================================
-# <<< ALTERAÇÃO: Endpoint de dados agora diferencia dados em tempo real de históricos >>>
-# =========================================================================
 @app.route('/data', methods=['POST'])
 def receber_dados():
     payload = request.get_json()
@@ -436,20 +433,7 @@ def receber_dados():
     if not dados_leituras:
         return jsonify({"status": "sucesso", "message": "Nenhum dado para inserir"}), 200
 
-    # <<< NOVO 1: Define a tolerância para o que é considerado "tempo real" (em milissegundos) >>>
-    # 2000ms (2 segundos) é um valor razoável para acomodar pequenas latências de rede.
-    REALTIME_TOLERANCE_MS = 2000
-
-    # <<< NOVO 2: Pega o timestamp do dado MAIS RECENTE no lote recebido >>>
-    latest_timestamp = dados_leituras[-1].get('timestamp')
-    if not latest_timestamp:
-        # Se o último ponto não tiver timestamp, não podemos comparar. Salvamos e ignoramos a atualização.
-        print("Aviso: Lote recebido sem timestamp no último ponto. Apenas salvando no banco.")
-    
-    # <<< NOVO 3: Pega a hora atual do servidor em milissegundos >>>
-    server_current_time_ms = int(time.time() * 1000)
-
-    # Todos os dados, sejam em tempo real ou históricos, devem ser salvos no banco de dados.
+    # Todos os dados são salvos no banco de dados.
     params = [(sessao_id, l.get('timestamp'), l.get('x'), l.get('y'), l.get('z')) for l in dados_leituras]
     
     conn = get_db_connection()
@@ -459,25 +443,22 @@ def receber_dados():
     sql = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
     
     try:
-        # A inserção no banco ocorre incondicionalmente para garantir a integridade dos dados.
+        # A inserção no banco ocorre incondicionalmente.
         cursor.executemany(sql, params)
         
-        # <<< NOVO 4: VERIFICA SE O LOTE É "AO VIVO" ANTES DE ENVIAR PARA O DASHBOARD >>>
-        if latest_timestamp and (server_current_time_ms - latest_timestamp) < REALTIME_TOLERANCE_MS:
-            # O dado é recente. Inicia a tarefa em background para processar e enviar a atualização via WebSocket.
-            socketio.start_background_task(
-                target=process_and_push_update, 
-                session_id=sessao_id, 
-                novas_leituras=dados_leituras
-            )
-        else:
-            # O dado é antigo (histórico). Apenas logamos e NÃO enviamos para o dashboard.
-            print(f"Lote histórico recebido para a sessão {sessao_id}. Dados salvos no banco, mas não enviados ao dashboard em tempo real.")
-
+        # <<< ALTERAÇÃO: A verificação de tempo foi removida. >>>
+        # A tarefa de processamento e envio para o dashboard agora é chamada para TODOS os lotes de dados.
+        socketio.start_background_task(
+            target=process_and_push_update, 
+            session_id=sessao_id, 
+            novas_leituras=dados_leituras
+        )
+        
         return jsonify({"status": "sucesso"}), 201
-    except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
-    finally: conn.close()
-
+    except Exception as e: 
+        return jsonify({"status": "erro", "message": str(e)}), 500
+    finally: 
+        conn.close()
 # =================================================================================
 # <<< SUBSTITUIÇÃO: Antigo endpoint de polling agora serve apenas dados iniciais >>>
 # =================================================================================
