@@ -46,7 +46,7 @@ log = logging.getLogger('werkzeug')
 log.setLevel(LOG_LEVEL)
 app = Flask(__name__)
 # Certifique-se de que o async_mode é compatível com o seu servidor de produção (eventlet/gevent)
-socketio = SocketIO(app, async_mode="eventlet") 
+socketio = SocketIO(app, async_mode="eventlet", ping_timeout=20, ping_interval=10)
 connected_clients = {}
 # <<< NOVO >>> Dicionário para rastrear sessões ativas em tempo real
 # Formato: { 'paciente_nome': {'patient_id': 1, 'session_id': 10, 'patient_name': 'nome'} }
