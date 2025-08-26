@@ -11,6 +11,7 @@ import logging
 import pyodbc
 from datetime import datetime, timedelta
 import math 
+from collections import deque
 
 # ==========================
 # CONFIGURAÇÕES GLOBAIS
@@ -79,32 +80,25 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 # <<< FUNÇÃO CORRIGIDA: Lógica de "costura" de sinal para filtro contínuo >>>
 # =========================================================================
 def process_and_push_update(session_id, novas_leituras):
-    """
-    Processa os dados mais recentes de uma sessão e envia via WebSocket para os dashboards.
-    Esta função é executada em uma thread de fundo para não bloquear a resposta HTTP ao dispositivo.
-    """
-    if not novas_leituras:
+    if not novas_leituras or session_id not in cache_sessoes:
         return
 
-    # O contexto da aplicação é necessário para tarefas em background acessarem recursos do Flask
     with app.app_context():
-        conn = get_db_connection()
-        if not conn: return
-        
-        cursor = conn.cursor()
         try:
-            # 1. Pega o número total de amostras para a métrica
-            cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", int(session_id))
-            total_amostras = cursor.fetchone()[0]
+            # 1. Atualiza o cache com os novos dados
+            cache = cache_sessoes[session_id]
+            for leitura in novas_leituras:
+                cache['data'].append((leitura['x'], leitura['y'], leitura['z']))
+            
+            cache['total_samples'] += len(novas_leituras)
+            total_amostras = cache['total_samples']
+            
+            if len(cache['data']) < 100: return
 
-            sql_janela_analise = f"SELECT TOP ({JANELA_DE_ANALISE}) x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
-            cursor.execute(sql_janela_analise, int(session_id))
-            analysis_rows = cursor.fetchall()
-            if not analysis_rows: return
-            
-            df_analysis = pd.DataFrame.from_records(analysis_rows, columns=['x', 'y', 'z'])
-            
-            # --- Análise da Magnitude (existente, para RMS e Frequência Geral) ---
+            # 2. Prepara o DataFrame para análise a partir do cache (memória)
+            df_analysis = pd.DataFrame(list(cache['data']), columns=['x', 'y', 'z'])
+
+            # 3. Executa a mesma lógica de análise que você já tinha
             df_analysis['magnitude'] = np.sqrt(df_analysis['x']**2 + df_analysis['y']**2 + df_analysis['z']**2)
             sinal_magnitude_centralizado = df_analysis['magnitude'] - df_analysis['magnitude'].mean()
             sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(sinal_magnitude_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
@@ -112,84 +106,54 @@ def process_and_push_update(session_id, novas_leituras):
             intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
             freq_pico_magnitude = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
 
-            # <<< NOVO: Análise de frequência para cada eixo individualmente >>>
-            # Eixo X
-            sinal_x = df_analysis['x'] - df_analysis['x'].mean()
-            sinal_x_filtrado = filtrar_sinal_passa_faixa(sinal_x.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            sinal_x_filtrado = filtrar_sinal_passa_faixa((df_analysis['x'] - df_analysis['x'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
 
-            # Eixo Y
-            sinal_y = df_analysis['y'] - df_analysis['y'].mean()
-            sinal_y_filtrado = filtrar_sinal_passa_faixa(sinal_y.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            sinal_y_filtrado = filtrar_sinal_passa_faixa((df_analysis['y'] - df_analysis['y'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
 
-            # Eixo Z
-            sinal_z = df_analysis['z'] - df_analysis['z'].mean()
-            sinal_z_filtrado = filtrar_sinal_passa_faixa(sinal_z.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            sinal_z_filtrado = filtrar_sinal_passa_faixa((df_analysis['z'] - df_analysis['z'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
 
-            # --- Preparação dos dados para o gráfico (lógica existente) ---
+            # 4. Salva as métricas no banco de dados (a única interação com o BD nesta função)
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cursor = conn.cursor()
+                    sql_insert_analise = """
+                        INSERT INTO analises_janela 
+                            (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
+                        VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
+                    """
+                    cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico_magnitude, freq_pico_x, freq_pico_y, freq_pico_z)
+                except Exception as db_error:
+                    print(f"Erro ao salvar métrica histórica: {db_error}")
+                finally:
+                    conn.close()
+
+            # 5. Prepara o payload para o dashboard (usando apenas os dados novos)
             df_novos_dados = pd.DataFrame(novas_leituras)
-            df_novos_dados.rename(columns={'timestamp': 'timestamp_ms'}, inplace=True)
-
-            PONTOS_CONTEXTO = 40
-            primeiro_timestamp_novo = df_novos_dados['timestamp_ms'].iloc[0]
-            sql_contexto = f"SELECT TOP ({PONTOS_CONTEXTO}) x FROM leituras WHERE sessao_id = ? AND timestamp_ms < ? ORDER BY timestamp_ms DESC"
-            cursor.execute(sql_contexto, int(session_id), int(primeiro_timestamp_novo))
-            
-            pontos_x_contexto = [row.x for row in cursor.fetchall()]
-            pontos_x_contexto.reverse()
-
-            sinal_x_completo_para_filtro = pontos_x_contexto + list(df_novos_dados['x'])
-            sinal_x_completo_centralizado = np.array(sinal_x_completo_para_filtro) - np.mean(sinal_x_completo_para_filtro)
-            sinal_filtrado_completo = filtrar_sinal_passa_faixa(sinal_x_completo_centralizado, FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            
-            sinal_filtrado_novos = np.zeros(len(df_novos_dados))
-            if sinal_filtrado_completo.any():
-                inicio_slice = len(pontos_x_contexto)
-                sinal_filtrado_novos = sinal_filtrado_completo[inicio_slice:]
-
-            # <<< ALTERAÇÃO: Adiciona as novas métricas ao payload >>>
             payload = {
                 "sessionId": session_id,
                 "metrics": {
-                    "freq_dominante": freq_pico_magnitude, # Frequência da magnitude
-                    "intensidade_rms": intensidade_rms,
-                    "total_amostras": total_amostras,
-                    "freq_pico_x": freq_pico_x, # Nova métrica
-                    "freq_pico_y": freq_pico_y, # Nova métrica
-                    "freq_pico_z": freq_pico_z  # Nova métrica
+                    "freq_dominante": freq_pico_magnitude, "intensidade_rms": intensidade_rms,
+                    "total_amostras": total_amostras, "freq_pico_x": freq_pico_x,
+                    "freq_pico_y": freq_pico_y, "freq_pico_z": freq_pico_z
                 },
                 "charts": {
-                    "labels": df_novos_dados["timestamp_ms"].tolist(),
-                    "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
-                    "y": (df_novos_dados['y'] - df_novos_dados['y'].mean()).tolist(),
-                    "z": (df_novos_dados['z'] - df_novos_dados['z'].mean()).tolist(),
-                    "sinal_filtrado": sinal_filtrado_novos.tolist()
+                    "labels": [d['timestamp'] for d in novas_leituras],
+                    "x": df_novos_dados['x'].tolist(),
+                    "y": df_novos_dados['y'].tolist(),
+                    "z": df_novos_dados['z'].tolist(),
                 }
             }
+            socketio.emit('session_update', payload, room=f'session_room_{session_id}')
 
-            room_name = f'session_room_{session_id}'
-            socketio.emit('session_update', payload, room=room_name)
-
-            try:
-                # <<< ALTERAÇÃO: Adiciona as novas colunas ao INSERT >>>
-                sql_insert_analise = """
-                    INSERT INTO analises_janela 
-                        (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
-                    VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
-                """
-                # <<< ALTERAÇÃO: Passa os novos valores para o execute >>>
-                cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico_magnitude, freq_pico_x, freq_pico_y, freq_pico_z)
-            except Exception as db_error:
-                print(f"Erro ao salvar métrica histórica: {db_error}")
-        
         except Exception as e:
             print(f"Erro em process_and_push_update: {e}")
             import traceback
             traceback.print_exc()
-        finally:
-            conn.close()
+
             
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
@@ -553,6 +517,11 @@ def start_session():
 
         cursor.execute("INSERT INTO sessoes (paciente_id, timestamp_inicio) OUTPUT INSERTED.id VALUES (?, GETDATE())", paciente_id)
         nova_sessao_id = cursor.fetchone().id
+
+        cache_sessoes[nova_sessao_id] = {
+            'data': deque(maxlen=JANELA_DE_ANALISE),
+            'total_samples': 0
+        }
         
         active_sessions[patient_name_for_dict] = {
             'patient_id': paciente_id,
@@ -588,6 +557,12 @@ def stop_session():
     sid = client_data.get('sid')
     if not sid:
         return jsonify({"status": "erro", "message": "SID do paciente não encontrado."}), 500
+
+    if patient_id in active_sessions:
+        session_id_to_stop = active_sessions[patient_id].get('session_id')
+        if session_id_to_stop and session_id_to_stop in cache_sessoes:
+            del cache_sessoes[session_id_to_stop]
+            print(f"Cache para a sessão {session_id_to_stop} foi limpo.")
 
     # 1. Envia o comando para o celular parar de monitorar usando o 'sid' correto
     socketio.emit('stop_monitoring', room=sid)
@@ -671,6 +646,10 @@ def handle_disconnect():
         # Se por acaso o paciente que desconectou era o que estava na sessão ativa,
         # removemos ele da lista de ativos para a UI ficar correta.
         if disconnected_patient in active_sessions:
+            session_id_to_stop = active_sessions[disconnected_patient].get('session_id')
+            if session_id_to_stop and session_id_to_stop in cache_sessoes:
+                del cache_sessoes[session_id_to_stop]
+                print(f"Cache para a sessão {session_id_to_stop} do paciente desconectado foi limpo.")
             del active_sessions[disconnected_patient]
             print(f"Sessão do paciente desconectado '{disconnected_patient}' removida da lista de ativas.")
 
@@ -689,6 +668,10 @@ def handle_session_stopped(data):
     # A lógica é a mesma de quando o 'disconnect' ou o botão do site são acionados:
     # Remove o paciente da lista de sessões ativas.
     if patient_name in active_sessions:
+        session_id_to_stop = active_sessions[patient_name].get('session_id')
+        if session_id_to_stop and session_id_to_stop in cache_sessoes:
+            del cache_sessoes[session_id_to_stop]
+            print(f"Cache para a sessão {session_id_to_stop} (parada pelo cliente) foi limpo.")
         del active_sessions[patient_name]
         
         # Emite um evento para todos os dashboards atualizarem a sua lista.
