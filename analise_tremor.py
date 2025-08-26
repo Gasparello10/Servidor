@@ -79,11 +79,16 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 # =========================================================================
 # <<< FUNÇÃO CORRIGIDA: Lógica de "costura" de sinal para filtro contínuo >>>
 # =========================================================================
+# <<< SUBSTITUA A FUNÇÃO INTEIRA POR ESTA VERSÃO CORRIGIDA >>>
 def process_and_push_update(session_id, novas_leituras):
     if not novas_leituras or session_id not in cache_sessoes:
         return
 
     with app.app_context():
+        conn = get_db_connection()
+        if not conn: return
+        
+        cursor = conn.cursor()
         try:
             # 1. Atualiza o cache com os novos dados
             cache = cache_sessoes[session_id]
@@ -98,7 +103,7 @@ def process_and_push_update(session_id, novas_leituras):
             # 2. Prepara o DataFrame para análise a partir do cache (memória)
             df_analysis = pd.DataFrame(list(cache['data']), columns=['x', 'y', 'z'])
 
-            # 3. Executa a mesma lógica de análise que você já tinha
+            # 3. Executa a lógica de análise de métricas (rápida, em memória)
             df_analysis['magnitude'] = np.sqrt(df_analysis['x']**2 + df_analysis['y']**2 + df_analysis['z']**2)
             sinal_magnitude_centralizado = df_analysis['magnitude'] - df_analysis['magnitude'].mean()
             sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(sinal_magnitude_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
@@ -115,24 +120,40 @@ def process_and_push_update(session_id, novas_leituras):
             sinal_z_filtrado = filtrar_sinal_passa_faixa((df_analysis['z'] - df_analysis['z'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
 
-            # 4. Salva as métricas no banco de dados (a única interação com o BD nesta função)
-            conn = get_db_connection()
-            if conn:
-                try:
-                    cursor = conn.cursor()
-                    sql_insert_analise = """
-                        INSERT INTO analises_janela 
-                            (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
-                        VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
-                    """
-                    cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico_magnitude, freq_pico_x, freq_pico_y, freq_pico_z)
-                except Exception as db_error:
-                    print(f"Erro ao salvar métrica histórica: {db_error}")
-                finally:
-                    conn.close()
-
-            # 5. Prepara o payload para o dashboard (usando apenas os dados novos)
+            # <<< CÓDIGO REINTEGRADO: Lógica para preparar o sinal filtrado para o gráfico >>>
             df_novos_dados = pd.DataFrame(novas_leituras)
+            df_novos_dados.rename(columns={'timestamp': 'timestamp_ms'}, inplace=True)
+
+            PONTOS_CONTEXTO = 40
+            primeiro_timestamp_novo = df_novos_dados['timestamp_ms'].iloc[0]
+            sql_contexto = f"SELECT TOP ({PONTOS_CONTEXTO}) x FROM leituras WHERE sessao_id = ? AND timestamp_ms < ? ORDER BY timestamp_ms DESC"
+            cursor.execute(sql_contexto, int(session_id), int(primeiro_timestamp_novo))
+            
+            pontos_x_contexto = [row.x for row in cursor.fetchall()]
+            pontos_x_contexto.reverse()
+
+            sinal_x_completo_para_filtro = pontos_x_contexto + list(df_novos_dados['x'])
+            sinal_x_completo_centralizado = np.array(sinal_x_completo_para_filtro) - np.mean(sinal_x_completo_para_filtro)
+            sinal_filtrado_completo = filtrar_sinal_passa_faixa(sinal_x_completo_centralizado, FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            
+            sinal_filtrado_novos = np.zeros(len(df_novos_dados))
+            if sinal_filtrado_completo.any():
+                inicio_slice = len(pontos_x_contexto)
+                sinal_filtrado_novos = sinal_filtrado_completo[inicio_slice:]
+            # --- Fim do código reintegrado ---
+
+            # 4. Salva as métricas no banco de dados
+            try:
+                sql_insert_analise = """
+                    INSERT INTO analises_janela 
+                        (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
+                    VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
+                """
+                cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico_magnitude, freq_pico_x, freq_pico_y, freq_pico_z)
+            except Exception as db_error:
+                print(f"Erro ao salvar métrica histórica: {db_error}")
+
+            # 5. Prepara o payload final para o dashboard
             payload = {
                 "sessionId": session_id,
                 "metrics": {
@@ -141,10 +162,11 @@ def process_and_push_update(session_id, novas_leituras):
                     "freq_pico_y": freq_pico_y, "freq_pico_z": freq_pico_z
                 },
                 "charts": {
-                    "labels": [d['timestamp'] for d in novas_leituras],
-                    "x": df_novos_dados['x'].tolist(),
-                    "y": df_novos_dados['y'].tolist(),
-                    "z": df_novos_dados['z'].tolist(),
+                    "labels": df_novos_dados["timestamp_ms"].tolist(),
+                    "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
+                    "y": (df_novos_dados['y'] - df_novos_dados['y'].mean()).tolist(),
+                    "z": (df_novos_dados['z'] - df_novos_dados['z'].mean()).tolist(),
+                    "sinal_filtrado": sinal_filtrado_novos.tolist() # <<< A CHAVE QUE FALTAVA FOI ADICIONADA
                 }
             }
             socketio.emit('session_update', payload, room=f'session_room_{session_id}')
@@ -153,8 +175,9 @@ def process_and_push_update(session_id, novas_leituras):
             print(f"Erro em process_and_push_update: {e}")
             import traceback
             traceback.print_exc()
+        finally:
+            conn.close()
 
-            
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
     # Transforma o dicionário complexo em uma lista simples para o frontend
