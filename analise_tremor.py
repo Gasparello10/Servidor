@@ -15,29 +15,20 @@ import math
 # ==========================
 # CONFIGURAÇÕES GLOBAIS
 # ==========================
-# --- Parâmetros de análise de sinal ---
-TAXA_AMOSTRAGEM = 50              # Hz
-FREQ_CORTE_BAIXA = 1.0            # Hz
-FREQ_CORTE_ALTA = 8.0             # Hz
-JANELA_DE_ANALISE = 1000          # Nº de amostras para cálculo de RMS e Welch
+TAXA_AMOSTRAGEM = 50
+FREQ_CORTE_BAIXA = 1.0
+FREQ_CORTE_ALTA = 8.0
+JANELA_DE_ANALISE = 1000
 NPERSEG_WELCH = 512   
-cache_sessoes = {}
-
-# --- Configurações do servidor ---
 HOST = '0.0.0.0'
 PORT = 5000
-TEMPO_REQUISICAO_MS = 500 # Intervalo entre atualizações no dashboard (ms) - AGORA USADO APENAS COMO REFERÊNCIA
-
-# --- Configurações de banco de dados ---
 CONN_STR = (
     r'DRIVER={ODBC Driver 17 for SQL Server};'
-    r'SERVER=localhost;'
+    r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
     r'DATABASE=AnaliseTremorDB;'
     r'Trusted_Connection=yes;'
 )
-
-# --- Ajustes de log ---
-LOG_LEVEL = logging.ERROR  # logging.DEBUG, logging.INFO, etc.
+LOG_LEVEL = logging.ERROR
 
 # ==========================
 # INICIALIZAÇÃO
@@ -45,11 +36,10 @@ LOG_LEVEL = logging.ERROR  # logging.DEBUG, logging.INFO, etc.
 log = logging.getLogger('werkzeug')
 log.setLevel(LOG_LEVEL)
 app = Flask(__name__)
-# Certifique-se de que o async_mode é compatível com o seu servidor de produção (eventlet/gevent)
 socketio = SocketIO(app, async_mode="eventlet") 
+
+# Dicionários de estado do servidor (Padronizado para 'connected_clients')
 connected_clients = {}
-# <<< NOVO >>> Dicionário para rastrear sessões ativas em tempo real
-# Formato: { 'paciente_nome': {'patient_id': 1, 'session_id': 10, 'patient_name': 'nome'} }
 active_sessions = {}
 
 # --- LÓGICA DE BANCO DE DADOS ---
@@ -75,80 +65,72 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
     pico_idx = np.argmax(psd[1:]) + 1
     return freqs[pico_idx]
 
-# =========================================================================
-# <<< FUNÇÃO CORRIGIDA: Lógica de "costura" de sinal para filtro contínuo >>>
-# =========================================================================
+# <<< FUNÇÃO ATUALIZADA >>>
 def process_and_push_update(session_id, novas_leituras):
-    """
-    Processa os dados mais recentes de uma sessão e envia via WebSocket para os dashboards.
-    Esta função é executada em uma thread de fundo para não bloquear a resposta HTTP ao dispositivo.
-    """
     if not novas_leituras:
         return
 
-    # O contexto da aplicação é necessário para tarefas em background acessarem recursos do Flask
     with app.app_context():
         conn = get_db_connection()
         if not conn: return
         
         cursor = conn.cursor()
         try:
-            # 1. Pega o número total de amostras para a métrica
             cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", int(session_id))
             total_amostras = cursor.fetchone()[0]
 
-            # <<< ALTERAÇÃO 1: Buscar os 3 eixos (x, y, z) para a análise >>>
             sql_janela_analise = f"SELECT TOP ({JANELA_DE_ANALISE}) x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
             cursor.execute(sql_janela_analise, int(session_id))
             analysis_rows = cursor.fetchall()
             if not analysis_rows: return
             
-            # <<< ALTERAÇÃO 2: Criar o DataFrame com as 3 colunas >>>
             df_analysis = pd.DataFrame.from_records(analysis_rows, columns=['x', 'y', 'z'])
             
-            # <<< ALTERAÇÃO 3: Calcular a magnitude do vetor de aceleração >>>
             df_analysis['magnitude'] = np.sqrt(df_analysis['x']**2 + df_analysis['y']**2 + df_analysis['z']**2)
-
-            # <<< ALTERAÇÃO 4: Usar o sinal de magnitude para toda a análise >>>
-            sinal_analise_centralizado = df_analysis['magnitude'] - df_analysis['magnitude'].mean()
-            sinal_analise_filtrado = filtrar_sinal_passa_faixa(sinal_analise_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            sinal_magnitude_centralizado = df_analysis['magnitude'] - df_analysis['magnitude'].mean()
+            sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(sinal_magnitude_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             
-            intensidade_rms = np.sqrt(np.mean(sinal_analise_filtrado**2)) if sinal_analise_filtrado.any() else 0.0
-            freq_pico = analisar_frequencia_com_welch(sinal_analise_filtrado, TAXA_AMOSTRAGEM) if sinal_analise_filtrado.any() else 0.0
+            intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
+            freq_pico_magnitude = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
 
-            # 3. Prepara os dados NOVOS para enviar ao gráfico com "costura" para um filtro contínuo
+            sinal_x_filtrado = filtrar_sinal_passa_faixa((df_analysis['x'] - df_analysis['x'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
+
+            sinal_y_filtrado = filtrar_sinal_passa_faixa((df_analysis['y'] - df_analysis['y'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
+
+            sinal_z_filtrado = filtrar_sinal_passa_faixa((df_analysis['z'] - df_analysis['z'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
+
             df_novos_dados = pd.DataFrame(novas_leituras)
             df_novos_dados.rename(columns={'timestamp': 'timestamp_ms'}, inplace=True)
 
-            # Busca pontos anteriores para dar contexto ao filtro e evitar falhas com pacotes pequenos
-            # (Nota: A parte visual do filtro no gráfico continua usando o eixo X por simplicidade)
             PONTOS_CONTEXTO = 40
             primeiro_timestamp_novo = df_novos_dados['timestamp_ms'].iloc[0]
             sql_contexto = f"SELECT TOP ({PONTOS_CONTEXTO}) x FROM leituras WHERE sessao_id = ? AND timestamp_ms < ? ORDER BY timestamp_ms DESC"
             cursor.execute(sql_contexto, int(session_id), int(primeiro_timestamp_novo))
-            
             pontos_x_contexto = [row.x for row in cursor.fetchall()]
-            pontos_x_contexto.reverse() # Ordena do mais antigo para o mais novo
+            pontos_x_contexto.reverse()
 
-            # Combina o contexto com os novos dados
             sinal_x_completo_para_filtro = pontos_x_contexto + list(df_novos_dados['x'])
             sinal_x_completo_centralizado = np.array(sinal_x_completo_para_filtro) - np.mean(sinal_x_completo_para_filtro)
-            
-            # Filtra o sinal combinado
             sinal_filtrado_completo = filtrar_sinal_passa_faixa(sinal_x_completo_centralizado, FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             
-            # Extrai apenas a parte filtrada correspondente aos NOVOS dados
+            sinal_filtrado_novos = np.zeros(len(df_novos_dados))
             if sinal_filtrado_completo.any():
                 inicio_slice = len(pontos_x_contexto)
                 sinal_filtrado_novos = sinal_filtrado_completo[inicio_slice:]
-            else:
-                # Caso o filtro falhe mesmo com o contexto, retorna zeros para manter a sincronia dos gráficos
-                sinal_filtrado_novos = np.zeros(len(df_novos_dados))
 
-            # 4. Monta o payload para enviar via WebSocket
             payload = {
-                "sessionId": session_id, # Importante para o frontend saber para qual sessão é a atualização
-                "metrics": {"freq_dominante": freq_pico, "intensidade_rms": intensidade_rms, "total_amostras": total_amostras},
+                "sessionId": session_id,
+                "metrics": {
+                    "freq_dominante": freq_pico_magnitude,
+                    "intensidade_rms": intensidade_rms,
+                    "total_amostras": total_amostras,
+                    "freq_pico_x": freq_pico_x,
+                    "freq_pico_y": freq_pico_y,
+                    "freq_pico_z": freq_pico_z
+                },
                 "charts": {
                     "labels": df_novos_dados["timestamp_ms"].tolist(),
                     "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
@@ -157,17 +139,15 @@ def process_and_push_update(session_id, novas_leituras):
                     "sinal_filtrado": sinal_filtrado_novos.tolist()
                 }
             }
-
-            # 5. Emite o evento para a sala da sessão específica
-            room_name = f'session_room_{session_id}'
-            socketio.emit('session_update', payload, room=room_name)
+            socketio.emit('session_update', payload, room=f'session_room_{session_id}')
 
             try:
                 sql_insert_analise = """
-                    INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, freq_pico)
-                    VALUES (?, GETDATE(), ?, ?);
+                    INSERT INTO analises_janela 
+                        (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
+                    VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
                 """
-                cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico)
+                cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico_magnitude, freq_pico_x, freq_pico_y, freq_pico_z)
             except Exception as db_error:
                 print(f"Erro ao salvar métrica histórica: {db_error}")
         
@@ -178,23 +158,12 @@ def process_and_push_update(session_id, novas_leituras):
         finally:
             conn.close()
 
-
-# <<< NOVO: Função centralizada para enviar o estado completo para os dashboards >>>
-def emit_state_update():
-    """Envia o estado atual de clientes conectados e sessões ativas."""
-    state_payload = {
-        'online_patients': list(connected_clients.keys()),
-        'active_sessions': list(active_sessions.values())
-    }
-    socketio.emit('state_update', state_payload, room='dashboards')
-
-
 # --- Endpoints HTTP ---
 @app.route('/')
 def dashboard():
-    # Passamos a variável para o template, embora não seja mais usada para polling
-    return render_template('dashboard.html', tempo_requisicao_ms=TEMPO_REQUISICAO_MS)
+    return render_template('dashboard.html')
 
+# ... (outras rotas HTTP: /api/structure, /api/archived_patients, etc., continuam as mesmas) ...
 @app.route('/api/structure')
 def get_session_structure():
     conn = get_db_connection()
@@ -236,22 +205,16 @@ def get_monthly_heatmap():
     patient_id = request.args.get('patient_id')
     year = request.args.get('year')
     month = request.args.get('month')
-
     if not all([patient_id, year, month]):
         return jsonify({"error": "Parâmetros 'patient_id', 'year' e 'month' são obrigatórios."}), 400
-
     try:
-        # Garante que os parâmetros são inteiros para evitar SQL Injection
         patient_id, year, month = int(patient_id), int(year), int(month)
     except ValueError:
         return jsonify({"error": "Parâmetros devem ser números inteiros."}), 400
-
     conn = get_db_connection()
     if not conn:
         return jsonify({"error": "Falha na conexão com o banco"}), 500
-
     cursor = conn.cursor()
-    # Query para calcular a média de RMS para cada dia do mês especificado
     sql = """
         SELECT
             DAY(aj.timestamp_janela) as dia,
@@ -267,7 +230,6 @@ def get_monthly_heatmap():
     """
     try:
         cursor.execute(sql, patient_id, year, month)
-        # Transforma o resultado em um dicionário {dia: media_rms} para fácil acesso no frontend
         heatmap_data = {row.dia: row.media_rms for row in cursor.fetchall()}
         return jsonify(heatmap_data)
     except Exception as e:
@@ -281,32 +243,22 @@ def get_historical_data():
     patient_id = request.args.get('patient_id')
     end_date_str = request.args.get('end_date', datetime.utcnow().strftime('%Y%m%d'))
     start_date_str = request.args.get('start_date', (datetime.utcnow() - timedelta(days=30)).strftime('%Y%m%d'))
-    
     try:
         interval_minutes = int(request.args.get('interval', '60'))
         if interval_minutes not in [2, 5, 10, 30, 60]:
             return jsonify({"error": "Intervalo inválido."}), 400
     except ValueError:
         return jsonify({"error": "Intervalo deve ser um número."}), 400
-
     if not patient_id:
         return jsonify({"error": "ID do paciente não fornecido"}), 400
-
     start_date_for_sql = start_date_str.replace('-', '')
     end_date_for_sql = end_date_str.replace('-', '')
-
     conn = get_db_connection()
     if not conn:
         return jsonify({"error": "Falha na conexão com o banco"}), 500
-
     cursor = conn.cursor()
-    response_data = {
-        "daily_summary": [],
-        "interval_summary": []
-    }
-
+    response_data = {"daily_summary": [], "interval_summary": []}
     try:
-        # Query para o resumo diário (sem alterações)
         sql_daily = """
             SELECT CONVERT(date, aj.timestamp_janela) AS dia, AVG(aj.intensidade_rms) AS media_rms, MAX(aj.intensidade_rms) AS max_rms, AVG(aj.freq_pico) AS media_freq
             FROM analises_janela aj JOIN sessoes s ON aj.sessao_id = s.id
@@ -319,8 +271,6 @@ def get_historical_data():
                 "date": row.dia.strftime('%Y-%m-%d'), "avg_rms": row.media_rms,
                 "max_rms": row.max_rms, "avg_freq": row.media_freq
             })
-
-        # <<< CORREÇÃO AQUI: A query de intervalo foi reescrita com um CTE >>>
         sql_interval = """
             WITH TimeBuckets AS (
                 SELECT
@@ -330,33 +280,20 @@ def get_historical_data():
                 JOIN sessoes s ON aj.sessao_id = s.id
                 WHERE s.paciente_id = ? AND aj.timestamp_janela >= ? AND aj.timestamp_janela < DATEADD(day, 1, ?)
             )
-            SELECT
-                bucket_index AS time_bucket,
-                AVG(intensidade_rms) AS media_rms
-            FROM TimeBuckets
-            GROUP BY bucket_index
-            ORDER BY time_bucket;
+            SELECT bucket_index AS time_bucket, AVG(intensidade_rms) AS media_rms
+            FROM TimeBuckets GROUP BY bucket_index ORDER BY time_bucket;
         """
-        # Note que 'interval_minutes' agora é passado apenas uma vez
         cursor.execute(sql_interval, interval_minutes, int(patient_id), start_date_for_sql, end_date_for_sql)
-        
         total_buckets = (24 * 60) // interval_minutes
         interval_map = {row.time_bucket: row.media_rms for row in cursor.fetchall()}
-        
         final_interval_list = []
         for i in range(total_buckets):
             hour = (i * interval_minutes) // 60
             minute = (i * interval_minutes) % 60
             label = f"{hour:02d}:{minute:02d}"
-            final_interval_list.append({
-                "label": label,
-                "avg_rms": interval_map.get(i, 0)
-            })
-        
+            final_interval_list.append({"label": label, "avg_rms": interval_map.get(i, 0)})
         response_data["interval_summary"] = final_interval_list
-        
         return jsonify(response_data)
-
     except Exception as e:
         print(f"Erro ao buscar dados históricos: {e}")
         return jsonify({"error": str(e)}), 500
@@ -374,17 +311,10 @@ def archive_patient():
     sql = "UPDATE pacientes SET esta_ativo = 0 WHERE id = ?"
     try:
         cursor.execute(sql, patient_id)
-        print(f"Paciente com ID {patient_id} arquivado com sucesso.")
         socketio.emit('structure_changed')
         return jsonify({"status": "sucesso", "message": f"Paciente {patient_id} arquivado."})
     except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
     finally: conn.close()
-
-# <<< NOVO >>> Endpoint para obter a lista de sessões ativas
-@app.route('/api/active_sessions')
-def get_active_sessions():
-    # Retorna a lista de valores do nosso dicionário de controle
-    return jsonify(list(active_sessions.values()))
 
 @app.route('/api/restore_patient', methods=['POST'])
 def restore_patient():
@@ -397,15 +327,11 @@ def restore_patient():
     sql = "UPDATE pacientes SET esta_ativo = 1 WHERE id = ?"
     try:
         cursor.execute(sql, patient_id)
-        print(f"Paciente com ID {patient_id} restaurado com sucesso.")
         socketio.emit('structure_changed')
         return jsonify({"status": "sucesso", "message": f"Paciente {patient_id} restaurado."})
     except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
     finally: conn.close()
 
-# =========================================================================
-# <<< ALTERAÇÃO: Endpoint de dados agora dispara a atualização via WebSocket >>>
-# =========================================================================
 @app.route('/data', methods=['POST'])
 def receber_dados():
     payload = request.get_json()
@@ -427,19 +353,18 @@ def receber_dados():
     
     try:
         cursor.executemany(sql, params)
-        # Dispara a tarefa em background para processar e enviar a atualização
         socketio.start_background_task(
             target=process_and_push_update, 
             session_id=sessao_id, 
             novas_leituras=dados_leituras
         )
         return jsonify({"status": "sucesso"}), 201
-    except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
-    finally: conn.close()
+    except Exception as e: 
+        return jsonify({"status": "erro", "message": str(e)}), 500
+    finally: 
+        conn.close()
 
-# =================================================================================
-# <<< SUBSTITUIÇÃO: Antigo endpoint de polling agora serve apenas dados iniciais >>>
-# =================================================================================
+# <<< FUNÇÃO ATUALIZADA >>>
 @app.route('/api/initial_session_data')
 def initial_session_data():
     session_id = request.args.get('id')
@@ -450,40 +375,53 @@ def initial_session_data():
     cursor = conn.cursor()
 
     try:
-        # Pega o número total de amostras
         cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", int(session_id))
         total_amostras = cursor.fetchone()[0]
 
-        # Busca a última janela de dados para análise e exibição inicial (ou todos os dados, se preferir)
         sql_janela = f"SELECT TOP ({JANELA_DE_ANALISE}) timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
         cursor.execute(sql_janela, int(session_id))
         rows = cursor.fetchall()
-        rows.reverse() # Ordena do mais antigo para o mais novo
+        rows.reverse()
         
         if not rows:
             return jsonify({
-                "metrics": {"total_amostras": total_amostras, "freq_dominante": 0, "intensidade_rms": 0}, 
+                "metrics": {"total_amostras": total_amostras, "freq_dominante": 0, "intensidade_rms": 0, "freq_pico_x": 0, "freq_pico_y": 0, "freq_pico_z": 0}, 
                 "charts": {"labels": [], "x": [], "y": [], "z": [], "sinal_filtrado": []}
             })
 
         df = pd.DataFrame.from_records(rows, columns=[desc[0] for desc in cursor.description])
         
-        # Análise baseada na magnitude dos 3 eixos
         df['magnitude'] = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2)
-        sinal_analise_centralizado = df['magnitude'] - df['magnitude'].mean()
-        sinal_analise_filtrado = filtrar_sinal_passa_faixa(sinal_analise_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        sinal_magnitude_centralizado = df['magnitude'] - df['magnitude'].mean()
+        sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(sinal_magnitude_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
         
-        intensidade_rms = np.sqrt(np.mean(sinal_analise_filtrado**2)) if sinal_analise_filtrado.any() else 0.0
-        freq_pico = analisar_frequencia_com_welch(sinal_analise_filtrado, TAXA_AMOSTRAGEM) if sinal_analise_filtrado.any() else 0.0
+        intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
+        freq_pico_magnitude = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
+
+        sinal_x_filtrado = filtrar_sinal_passa_faixa((df['x'] - df['x'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
+
+        sinal_y_filtrado = filtrar_sinal_passa_faixa((df['y'] - df['y'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
+
+        sinal_z_filtrado = filtrar_sinal_passa_faixa((df['z'] - df['z'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
 
         return jsonify({
-            "metrics": {"freq_dominante": freq_pico, "intensidade_rms": intensidade_rms, "total_amostras": total_amostras},
+            "metrics": {
+                "freq_dominante": freq_pico_magnitude,
+                "intensidade_rms": intensidade_rms,
+                "total_amostras": total_amostras,
+                "freq_pico_x": freq_pico_x,
+                "freq_pico_y": freq_pico_y,
+                "freq_pico_z": freq_pico_z
+            },
             "charts": {
                 "labels": df["timestamp_ms"].tolist(),
                 "x": (df['x'] - df['x'].mean()).tolist(),
                 "y": (df['y'] - df['y'].mean()).tolist(),
                 "z": (df['z'] - df['z'].mean()).tolist(),
-                "sinal_filtrado": sinal_analise_filtrado.tolist()
+                "sinal_filtrado": sinal_magnitude_filtrado.tolist()
             }
         })
     except Exception as e:
@@ -491,7 +429,6 @@ def initial_session_data():
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
-
         
 @app.route('/api/start_session', methods=['POST'])
 def start_session():
@@ -499,12 +436,16 @@ def start_session():
     patient_name_raw = data.get('patientId')
     if not patient_name_raw: return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
     
-    # <<< CORRIGIDO >>> Variáveis definidas corretamente no início da função.
     patient_name_for_dict = patient_name_raw
     patient_name_for_db = patient_name_raw.replace(" ", "_").lower()
 
-    sid = connected_clients.get(patient_name_for_dict)
-    if not sid: return jsonify({"status": "erro", "message": "Paciente não conectado."}), 404
+    client_data = connected_clients.get(patient_name_for_dict)
+    if not client_data: 
+        return jsonify({"status": "erro", "message": "Paciente não conectado via WebSocket."}), 404
+    
+    sid = client_data.get('sid')
+    if not sid:
+        return jsonify({"status": "erro", "message": "SID do paciente não encontrado."}), 500
     
     conn = get_db_connection()
     if not conn: return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
@@ -538,119 +479,91 @@ def start_session():
     except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
     finally: conn.close()
 
-
 @app.route('/api/stop_session', methods=['POST'])
 def stop_session():
     data = request.get_json()
-    patient_id = data.get('patientId') # Este é o nome do paciente
+    patient_id = data.get('patientId')
     if not patient_id: 
         return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
     
-    sid = connected_clients.get(patient_id)
-    if sid:
-        # 1. Envia o comando para o celular parar de monitorar
-        socketio.emit('stop_monitoring', room=sid)
-        print(f"Comando 'stop' enviado para o paciente: {patient_id}")
-
-        # 2. Modifica o estado no servidor
-        if patient_id in active_sessions:
-            del active_sessions[patient_id]
-            print(f"Sessão do paciente '{patient_id}' removida da lista de ativas.")
-
-        # 3. Notifica os dashboards sobre a mudança de estado E estrutura
-        emit_state_update()
-        socketio.emit('structure_changed')
-        
-        return jsonify({"status": "sucesso", "message": "Comando de parada enviado."})
-    else: 
+    client_data = connected_clients.get(patient_id)
+    if not client_data:
         return jsonify({"status": "erro", "message": "Paciente não conectado."}), 404
+        
+    sid = client_data.get('sid')
+    if not sid:
+        return jsonify({"status": "erro", "message": "SID do paciente não encontrado."}), 500
+
+    socketio.emit('stop_monitoring', room=sid)
+    print(f"Comando 'stop' enviado para o paciente: {patient_id}")
+
+    if patient_id in active_sessions:
+        del active_sessions[patient_id]
+        print(f"Sessão do paciente '{patient_id}' removida da lista de ativas.")
+
+    emit_state_update()
+    socketio.emit('structure_changed')
     
+    return jsonify({"status": "sucesso", "message": "Comando de parada enviado."})
 
-# =============================================================
-# <<< ALTERAÇÃO: Novos handlers para inscrição nos canais da sessão >>>
-# =============================================================
+# --- Handlers de WebSocket ---
 @socketio.on('connect')
-def handle_connect(): print(f"Novo cliente conectado: {request.sid}")
-
-@socketio.on('subscribe_to_session')
-def handle_subscribe_to_session(data):
-    session_id = data.get('id')
-    if session_id:
-        room_name = f'session_room_{session_id}'
-        join_room(room_name)
-        print(f"Cliente {request.sid} inscrito na sala {room_name}")
-
-@socketio.on('unsubscribe_from_session')
-def handle_unsubscribe_from_session(data):
-    session_id = data.get('id')
-    if session_id:
-        room_name = f'session_room_{session_id}'
-        leave_room(room_name)
-        print(f"Cliente {request.sid} cancelou inscrição da sala {room_name}")
-
-@socketio.on('join_dashboard')
-def handle_join_dashboard():
-    join_room('dashboards'); emit_state_update()
-
-@socketio.on('register_patient')
-def handle_register(data):
-    patient_id = data.get('patientId')
-    if patient_id:
-        connected_clients[patient_id] = request.sid
-        print(f"Paciente '{patient_id}' registrado com SID: {request.sid}")
-        emit_state_update()
+def handle_connect():
+    print(f"Novo cliente conectado: {request.sid}")
 
 @socketio.on('disconnect')
 def handle_disconnect():
     print(f"Cliente desconectado: {request.sid}")
     disconnected_patient = None
-    for patient, sid in list(connected_clients.items()):
-        if sid == request.sid:
-            disconnected_patient = patient
+    for patient_name, client_data in list(connected_clients.items()):
+        if client_data['sid'] == request.sid:
+            disconnected_patient = patient_name
             break
     
     if disconnected_patient:
-        # Remove o paciente da lista de conectados
         del connected_clients[disconnected_patient]
-        print(f"Paciente '{disconnected_patient}' desconectado.")
-
-        # Remove a sessão (se existir) da lista de ativas
+        print(f"Paciente '{disconnected_patient}' removido da lista de online.")
         if disconnected_patient in active_sessions:
             del active_sessions[disconnected_patient]
             print(f"Sessão do paciente desconectado '{disconnected_patient}' removida da lista de ativas.")
-
-        # Envia uma única atualização de estado completa para todos os dashboards.
         emit_state_update()
 
-# <<< NOVO >>> Handler para quando o cliente (celular) informa que a sessão parou.
+@socketio.on('join_dashboard')
+def handle_join_dashboard():
+    join_room('dashboards')
+    emit_state_update()
+
+@socketio.on('register_patient')
+def handle_register(data):
+    patient_id = data.get('patientId')
+    if patient_id:
+        connected_clients[patient_id] = {'sid': request.sid, 'battery': None}
+        print(f"Paciente '{patient_id}' registrado com SID: {request.sid}")
+        emit_state_update()
+
+@socketio.on('watch_status_update')
+def handle_watch_status(data):
+    patient_id = data.get('patientId')
+    battery_level = data.get('batteryLevel')
+    if patient_id and patient_id in connected_clients:
+        connected_clients[patient_id]['battery'] = battery_level
+        print(f"Status do relógio recebido de '{patient_id}': Bateria {battery_level}%")
+        emit_state_update()
+
 @socketio.on('session_stopped_by_client')
 def handle_session_stopped(data):
     patient_name = data.get('patientId')
-    if not patient_name:
-        return
-
-    print(f"Recebido evento 'session_stopped_by_client' para o paciente: {patient_name}")
-    
-    # A lógica é a mesma de quando o 'disconnect' ou o botão do site são acionados:
-    # Remove o paciente da lista de sessões ativas.
+    if not patient_name: return
     if patient_name in active_sessions:
         del active_sessions[patient_name]
-        
-        # Emite um evento para todos os dashboards atualizarem a sua lista.
-        emit_state_update() 
         print(f"Sessão do paciente '{patient_name}' removida da lista de ativas via app.")
+        emit_state_update() 
 
-# <<< NOVO >>> Handler para quando um cliente se reconecta e informa que já tem uma sessão ativa.
 @socketio.on('resume_active_session')
 def handle_resume_session(data):
     patient_name = data.get('patientName')
     session_id = data.get('sessionId')
-
-    if not patient_name or not session_id:
-        return
-
-    print(f"Recebido evento 'resume_active_session' do paciente '{patient_name}' para a sessão {session_id}")
-
+    if not patient_name or not session_id: return
     conn = get_db_connection()
     if not conn: return
     cursor = conn.cursor()
@@ -666,18 +579,27 @@ def handle_resume_session(data):
                 'session_id': session_id,
                 'patient_name': patient_name
             }
-        
-            # 1. Avisa o cliente para recarregar a estrutura dos dropdowns
             socketio.emit('structure_changed')
-            # 2. Envia o estado completo e atualizado (pacientes online E ativos)
             emit_state_update()
-
             print(f"Sessão {session_id} do paciente '{patient_name}' restaurada na lista de ativas.")
-
     except Exception as e:
         print(f"Erro ao restaurar sessão: {e}")
     finally:
         conn.close()
+
+@socketio.on('subscribe_to_session')
+def handle_subscribe(data):
+    session_id = data.get('id')
+    if session_id:
+        join_room(f'session_room_{session_id}')
+        print(f"Cliente {request.sid} inscrito na sala da sessão {session_id}")
+
+@socketio.on('unsubscribe_from_session')
+def handle_unsubscribe(data):
+    session_id = data.get('id')
+    if session_id:
+        leave_room(f'session_room_{session_id}')
+        print(f"Cliente {request.sid} cancelou inscrição da sala da sessão {session_id}")
         
 # --- Função para obter IP local ---
 def get_ip():
@@ -698,5 +620,4 @@ if __name__ == '__main__':
     print(f"Celulares devem se conectar a: ws://{local_ip}:{port}")
     print("="*60)
     import eventlet
-    # Usando o servidor WSGI do eventlet que é compatível com flask-socketio
-    eventlet.wsgi.server(eventlet.listen((host, port)), app)
+    eventlet.wsgi.server(eventlet.listen((host, port)), a
