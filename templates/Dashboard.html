@@ -42,7 +42,6 @@
         .scale-btn { padding: 5px 10px; margin: 0 4px; border-radius: 4px; border: 1px solid #ccc; background-color: #f0f0f0; cursor: pointer; }
         .scale-btn.active { background-color: #007bff; color: white; border-color: #007bff; }
         
-        /* NOVO Estilo para o seletor de paciente no histórico */
         .history-patient-selector {
             padding: 15px;
             background-color: #f9f9f9;
@@ -63,7 +62,6 @@
             border: 1px solid #ccc;
         }
 
-        /* Estilos para o Heatmap */
         .heatmap-container {
             padding: 15px;
             background-color: #f8f9fa;
@@ -106,7 +104,7 @@
             background-color: #e9ecef;
         }
         .heatmap-day {
-            background-color: #e0e0e0; /* Cor para dias sem dados */
+            background-color: #e0e0e0;
             color: #777;
             min-height: 40px;
             display: flex;
@@ -248,13 +246,24 @@
         socket.on('session_started', (data) => {
             loadStructure(true, data.patientId, data.sessionId);
         });
+
+        // <<< FUNÇÃO AUXILIAR PARA ATUALIZAR AS MÉTRICAS >>>
+        function updateMetricsDisplay(metrics) {
+            if (!metrics) return;
+            document.getElementById("rms-value").innerText = (metrics.intensidade_rms || 0).toFixed(4);
+            document.getElementById("freq-value").innerText = (metrics.freq_dominante || 0).toFixed(2) + " Hz";
+            document.getElementById("samples-value").innerText = metrics.total_amostras || 0;
+            document.getElementById("freq-x-value").innerText = (metrics.freq_pico_x || 0).toFixed(2) + " Hz";
+            document.getElementById("freq-y-value").innerText = (metrics.freq_pico_y || 0).toFixed(2) + " Hz";
+            document.getElementById("freq-z-value").innerText = (metrics.freq_pico_z || 0).toFixed(2) + " Hz";
+        }
+
         socket.on('session_update', (data) => {
             if (!currentSessionId || data.sessionId != currentSessionId) return;
-            if (data.metrics) {
-                document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
-                document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
-                document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
-            }
+            
+            // <<< USA A FUNÇÃO AUXILIAR >>>
+            updateMetricsDisplay(data.metrics);
+            
             if (data.charts && data.charts.labels && data.charts.labels.length > 0) {
                 magnitudeChart.data.labels.push(...data.charts.labels);
                 magnitudeChart.data.datasets[0].data.push(...data.charts.sinal_filtrado);
@@ -289,7 +298,6 @@
                 li.style.cursor = 'pointer';
                 const nameSpan = document.createElement('span');
                 nameSpan.innerHTML = `<span class="status-dot" style="background-color: #0d6efd;"></span>${session.patient_name}`;
-                // O onclick agora chama a nova função direta
                 nameSpan.onclick = () => selectActiveSession(session.patient_id, session.session_id);
                 const stopButtonDiv = document.createElement('div');
                 stopButtonDiv.innerHTML = `<button class="control-btn stop-btn" onclick="stop('${session.patient_name}')">Parar</button>`;
@@ -299,44 +307,30 @@
             });
         }
         
-        // =================================================================================
-        // FUNÇÃO REESCRITA (CORREÇÃO PRINCIPAL)
-        // Esta função agora controla o fluxo de forma direta, sem simular eventos.
-        // =================================================================================
         function selectActiveSession(patientId, sessionId) {
-            // Se já estamos vendo esta sessão, não faz nada.
             if (currentSessionId === sessionId) {
-                // Apenas garante que a tela correta está visível
                 document.getElementById('history-view').style.display = 'none';
                 document.querySelector('.main-content > .session-selector').style.display = 'flex';
                 document.getElementById('analysis-content').style.display = 'block';
                 return;
             }
-
             console.log(`Forçando a seleção da sessão ativa: Paciente ${patientId}, Sessão ${sessionId}`);
-
-            // 1. Mudar para a tela de análise em tempo real
             document.getElementById('history-view').style.display = 'none';
             document.querySelector('.main-content > .session-selector').style.display = 'flex';
             
-            // 2. Encontrar os dados do paciente
             const patientData = allPatientsData.find(p => p.id == patientId);
             if (!patientData) {
                 console.error("Não foi possível encontrar dados para o paciente ID:", patientId);
                 return;
             }
-            
-            // 3. Cancelar a inscrição da sessão anterior (se houver)
             if (currentSessionId) {
                 socket.emit('unsubscribe_from_session', { id: currentSessionId });
             }
             
-            // 4. Atualizar os dropdowns
             const patientSelect = document.getElementById('patient-select');
             patientSelect.value = patientId;
-            populateSessionSelect(patientData.sessoes, sessionId); // Popula e já seleciona a sessão correta
+            populateSessionSelect(patientData.sessoes, sessionId);
             
-            // 5. Carregar os dados da nova sessão e se inscrever nela
             currentSessionId = sessionId;
             loadInitialSessionData(currentSessionId);
             socket.emit('subscribe_to_session', { id: currentSessionId });
@@ -476,11 +470,10 @@
             rawChart.update('none');
             fetch(`/api/initial_session_data?id=${sessionId}`).then(response => response.json()).then(data => {
                 if (data.error) { console.error("Erro:", data.error); return; }
-                if (data.metrics) {
-                    document.getElementById("freq-value").innerText = (data.metrics.freq_dominante || 0).toFixed(2) + " Hz";
-                    document.getElementById("rms-value").innerText = (data.metrics.intensidade_rms || 0).toFixed(4);
-                    document.getElementById("samples-value").innerText = data.metrics.total_amostras || 0;
-                }
+                
+                // <<< USA A FUNÇÃO AUXILIAR >>>
+                updateMetricsDisplay(data.metrics);
+                
                 if (data.charts && data.charts.labels) {
                     const labels = data.charts.labels.slice(-MAX_CHART_POINTS);
                     const filteredData = data.charts.sinal_filtrado.slice(-MAX_CHART_POINTS);
@@ -500,7 +493,19 @@
         }
         
         document.addEventListener('DOMContentLoaded', () => {
-            const analysisContentHTML = `<div class="metrics-grid"><div class="metric"><h3>Freq. Pico</h3><p id="freq-value">0.00 Hz</p></div><div class="metric"><h3>Intensidade (RMS)</h3><p id="rms-value">0.0000</p></div><div class="metric"><h3>Total de Amostras</h3><p id="samples-value">0</p></div></div><div class="scale-controls"><span>Escala (Dados Brutos): </span><button class="scale-btn active" data-scale="auto">Auto</button><button class="scale-btn" data-scale="5">±5</button><button class="scale-btn" data-scale="10">±10</button><button class="scale-btn" data-scale="15">±15</button><button class="scale-btn" data-scale="20">±20</button></div><div class="plot-container"><h3 id="magnitude-chart-title"></h3><canvas id="magnitudeChart"></canvas></div><div class="plot-container"><h3 id="raw-chart-title"></h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>`;
+           const analysisContentHTML = `
+            <div class="metrics-grid">
+                <div class="metric"><h3>Intensidade (RMS)</h3><p id="rms-value">0.0000</p></div>
+                <div class="metric"><h3>Freq. Pico (Total)</h3><p id="freq-value">0.00 Hz</p></div>
+                <div class="metric"><h3>Total de Amostras</h3><p id="samples-value">0</p></div>
+                <div class="metric"><h3>Freq. Pico (X)</h3><p id="freq-x-value">0.00 Hz</p></div>
+                <div class="metric"><h3>Freq. Pico (Y)</h3><p id="freq-y-value">0.00 Hz</p></div>
+                <div class="metric"><h3>Freq. Pico (Z)</h3><p id="freq-z-value">0.00 Hz</p></div>
+            </div>
+            <div class="scale-controls"><span>Escala (Dados Brutos): </span><button class="scale-btn active" data-scale="auto">Auto</button><button class="scale-btn" data-scale="5">±5</button><button class="scale-btn" data-scale="10">±10</button><button class="scale-btn" data-scale="15">±15</button><button class="scale-btn" data-scale="20">±20</button></div>
+            <div class="plot-container"><h3 id="magnitude-chart-title"></h3><canvas id="magnitudeChart"></canvas></div>
+            <div class="plot-container"><h3 id="raw-chart-title"></h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>
+        `;
             document.getElementById('analysis-content').innerHTML = analysisContentHTML;
             initializeCharts();
             initializeHistoryCharts(); 
@@ -549,17 +554,12 @@
                 });
             });
             
-            // =================================================================================
-            // LISTENER DO DROPDOWN DE PACIENTE (CORREÇÃO PRINCIPAL)
-            // Simplificado para apenas popular o próximo dropdown.
-            // =================================================================================
             document.getElementById('patient-select').addEventListener('change', function() {
                 const patientData = allPatientsData.find(p => p.id == this.value);
                 populateSessionSelect(patientData ? patientData.sessoes : []);
                 document.getElementById('analysis-content').style.display = 'none';
             });
             
-            // Listener do dropdown de sessão (lógica de troca de sessão fica aqui)
             document.getElementById('session-select').addEventListener('change', function() {
                 if (currentSessionId) {
                     socket.emit('unsubscribe_from_session', { id: currentSessionId });
@@ -623,11 +623,8 @@
                     </span>
                 `;
                 
-                // <<< CORREÇÃO AQUI >>>
-                // Agora, se a sessão estiver ativa, não mostramos nenhum botão aqui.
-                // O botão de "Parar" já aparece na lista de "Sessões Ativas".
                 const buttonHtml = isPatientActive 
-                    ? `<span style="font-size: 0.9em; color: green;">Em sessão...</span>` // Apenas mostra um status
+                    ? `<span style="font-size: 0.9em; color: green;">Em sessão...</span>`
                     : `<button class="control-btn start-btn" onclick="start('${patientName}')">Iniciar</button>`;
 
                 li.innerHTML = `${patientInfoHtml}<div>${buttonHtml}</div>`;
@@ -675,4 +672,4 @@
         }
     </script>
 </body>
-</html>
+</ht

@@ -97,58 +97,69 @@ def process_and_push_update(session_id, novas_leituras):
             cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", int(session_id))
             total_amostras = cursor.fetchone()[0]
 
-            # <<< ALTERAÇÃO 1: Buscar os 3 eixos (x, y, z) para a análise >>>
             sql_janela_analise = f"SELECT TOP ({JANELA_DE_ANALISE}) x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
             cursor.execute(sql_janela_analise, int(session_id))
             analysis_rows = cursor.fetchall()
             if not analysis_rows: return
             
-            # <<< ALTERAÇÃO 2: Criar o DataFrame com as 3 colunas >>>
             df_analysis = pd.DataFrame.from_records(analysis_rows, columns=['x', 'y', 'z'])
             
-            # <<< ALTERAÇÃO 3: Calcular a magnitude do vetor de aceleração >>>
+            # --- Análise da Magnitude (existente, para RMS e Frequência Geral) ---
             df_analysis['magnitude'] = np.sqrt(df_analysis['x']**2 + df_analysis['y']**2 + df_analysis['z']**2)
-
-            # <<< ALTERAÇÃO 4: Usar o sinal de magnitude para toda a análise >>>
-            sinal_analise_centralizado = df_analysis['magnitude'] - df_analysis['magnitude'].mean()
-            sinal_analise_filtrado = filtrar_sinal_passa_faixa(sinal_analise_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            sinal_magnitude_centralizado = df_analysis['magnitude'] - df_analysis['magnitude'].mean()
+            sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(sinal_magnitude_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             
-            intensidade_rms = np.sqrt(np.mean(sinal_analise_filtrado**2)) if sinal_analise_filtrado.any() else 0.0
-            freq_pico = analisar_frequencia_com_welch(sinal_analise_filtrado, TAXA_AMOSTRAGEM) if sinal_analise_filtrado.any() else 0.0
+            intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
+            freq_pico_magnitude = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
 
-            # 3. Prepara os dados NOVOS para enviar ao gráfico com "costura" para um filtro contínuo
+            # <<< NOVO: Análise de frequência para cada eixo individualmente >>>
+            # Eixo X
+            sinal_x = df_analysis['x'] - df_analysis['x'].mean()
+            sinal_x_filtrado = filtrar_sinal_passa_faixa(sinal_x.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
+
+            # Eixo Y
+            sinal_y = df_analysis['y'] - df_analysis['y'].mean()
+            sinal_y_filtrado = filtrar_sinal_passa_faixa(sinal_y.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
+
+            # Eixo Z
+            sinal_z = df_analysis['z'] - df_analysis['z'].mean()
+            sinal_z_filtrado = filtrar_sinal_passa_faixa(sinal_z.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
+
+            # --- Preparação dos dados para o gráfico (lógica existente) ---
             df_novos_dados = pd.DataFrame(novas_leituras)
             df_novos_dados.rename(columns={'timestamp': 'timestamp_ms'}, inplace=True)
 
-            # Busca pontos anteriores para dar contexto ao filtro e evitar falhas com pacotes pequenos
-            # (Nota: A parte visual do filtro no gráfico continua usando o eixo X por simplicidade)
             PONTOS_CONTEXTO = 40
             primeiro_timestamp_novo = df_novos_dados['timestamp_ms'].iloc[0]
             sql_contexto = f"SELECT TOP ({PONTOS_CONTEXTO}) x FROM leituras WHERE sessao_id = ? AND timestamp_ms < ? ORDER BY timestamp_ms DESC"
             cursor.execute(sql_contexto, int(session_id), int(primeiro_timestamp_novo))
             
             pontos_x_contexto = [row.x for row in cursor.fetchall()]
-            pontos_x_contexto.reverse() # Ordena do mais antigo para o mais novo
+            pontos_x_contexto.reverse()
 
-            # Combina o contexto com os novos dados
             sinal_x_completo_para_filtro = pontos_x_contexto + list(df_novos_dados['x'])
             sinal_x_completo_centralizado = np.array(sinal_x_completo_para_filtro) - np.mean(sinal_x_completo_para_filtro)
-            
-            # Filtra o sinal combinado
             sinal_filtrado_completo = filtrar_sinal_passa_faixa(sinal_x_completo_centralizado, FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             
-            # Extrai apenas a parte filtrada correspondente aos NOVOS dados
+            sinal_filtrado_novos = np.zeros(len(df_novos_dados))
             if sinal_filtrado_completo.any():
                 inicio_slice = len(pontos_x_contexto)
                 sinal_filtrado_novos = sinal_filtrado_completo[inicio_slice:]
-            else:
-                # Caso o filtro falhe mesmo com o contexto, retorna zeros para manter a sincronia dos gráficos
-                sinal_filtrado_novos = np.zeros(len(df_novos_dados))
 
-            # 4. Monta o payload para enviar via WebSocket
+            # <<< ALTERAÇÃO: Adiciona as novas métricas ao payload >>>
             payload = {
-                "sessionId": session_id, # Importante para o frontend saber para qual sessão é a atualização
-                "metrics": {"freq_dominante": freq_pico, "intensidade_rms": intensidade_rms, "total_amostras": total_amostras},
+                "sessionId": session_id,
+                "metrics": {
+                    "freq_dominante": freq_pico_magnitude, # Frequência da magnitude
+                    "intensidade_rms": intensidade_rms,
+                    "total_amostras": total_amostras,
+                    "freq_pico_x": freq_pico_x, # Nova métrica
+                    "freq_pico_y": freq_pico_y, # Nova métrica
+                    "freq_pico_z": freq_pico_z  # Nova métrica
+                },
                 "charts": {
                     "labels": df_novos_dados["timestamp_ms"].tolist(),
                     "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
@@ -158,16 +169,18 @@ def process_and_push_update(session_id, novas_leituras):
                 }
             }
 
-            # 5. Emite o evento para a sala da sessão específica
             room_name = f'session_room_{session_id}'
             socketio.emit('session_update', payload, room=room_name)
 
             try:
+                # <<< ALTERAÇÃO: Adiciona as novas colunas ao INSERT >>>
                 sql_insert_analise = """
-                    INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, freq_pico)
-                    VALUES (?, GETDATE(), ?, ?);
+                    INSERT INTO analises_janela 
+                        (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
+                    VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
                 """
-                cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico)
+                # <<< ALTERAÇÃO: Passa os novos valores para o execute >>>
+                cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico_magnitude, freq_pico_x, freq_pico_y, freq_pico_z)
             except Exception as db_error:
                 print(f"Erro ao salvar métrica histórica: {db_error}")
         
@@ -177,8 +190,7 @@ def process_and_push_update(session_id, novas_leituras):
             traceback.print_exc()
         finally:
             conn.close()
-
-
+            
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
     # Transforma o dicionário complexo em uma lista simples para o frontend
