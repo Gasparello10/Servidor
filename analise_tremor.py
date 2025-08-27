@@ -33,7 +33,7 @@ TEMPO_REQUISICAO_MS = 500 # Intervalo entre atualizações no dashboard (ms) - A
 CONN_STR = (
     r'DRIVER={ODBC Driver 17 for SQL Server};'
     r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
-    r'DATABASE=AnaliseTremorDB;'
+    r'DATABASE=AnaliseTremorDB_Teste;'
     r'Trusted_Connection=yes;'
 )
 
@@ -79,16 +79,11 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 # =========================================================================
 # <<< FUNÇÃO CORRIGIDA: Lógica de "costura" de sinal para filtro contínuo >>>
 # =========================================================================
-# <<< SUBSTITUA A FUNÇÃO INTEIRA POR ESTA VERSÃO CORRIGIDA >>>
 def process_and_push_update(session_id, novas_leituras):
     if not novas_leituras or session_id not in cache_sessoes:
         return
 
     with app.app_context():
-        conn = get_db_connection()
-        if not conn: return
-        
-        cursor = conn.cursor()
         try:
             # 1. Atualiza o cache com os novos dados
             cache = cache_sessoes[session_id]
@@ -100,73 +95,63 @@ def process_and_push_update(session_id, novas_leituras):
             
             if len(cache['data']) < 100: return
 
-            # 2. Prepara o DataFrame para análise a partir do cache (memória)
+            # 2. Prepara o DataFrame para análise a partir do cache (100% em memória)
             df_analysis = pd.DataFrame(list(cache['data']), columns=['x', 'y', 'z'])
 
-            # 3. Executa a lógica de análise de métricas (rápida, em memória)
-            df_analysis['magnitude'] = np.sqrt(df_analysis['x']**2 + df_analysis['y']**2 + df_analysis['z']**2)
-            sinal_magnitude_centralizado = df_analysis['magnitude'] - df_analysis['magnitude'].mean()
-            sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(sinal_magnitude_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            # 3. Centraliza os eixos ANTES de calcular a magnitude
+            x_centered = df_analysis['x'] - df_analysis['x'].mean()
+            y_centered = df_analysis['y'] - df_analysis['y'].mean()
+            z_centered = df_analysis['z'] - df_analysis['z'].mean()
             
+            df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
+            sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            
+            # 4. Calcula as métricas
             intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
-            freq_pico_magnitude = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
+            freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
 
-            sinal_x_filtrado = filtrar_sinal_passa_faixa((df_analysis['x'] - df_analysis['x'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
 
-            sinal_y_filtrado = filtrar_sinal_passa_faixa((df_analysis['y'] - df_analysis['y'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
 
-            sinal_z_filtrado = filtrar_sinal_passa_faixa((df_analysis['z'] - df_analysis['z'].mean()).to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+            sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
 
-            # <<< CÓDIGO REINTEGRADO: Lógica para preparar o sinal filtrado para o gráfico >>>
+            # 5. Salva as métricas no banco de dados (tarefa separada)
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cursor = conn.cursor()
+                    sql_insert_analise = """
+                        INSERT INTO analises_janela 
+                            (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
+                        VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
+                    """
+                    cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
+                except Exception as db_error:
+                    print(f"Erro ao salvar métrica histórica: {db_error}")
+                finally:
+                    conn.close()
+
+            # 6. Prepara o payload para o dashboard
+            sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(novas_leituras):]
+            
             df_novos_dados = pd.DataFrame(novas_leituras)
-            df_novos_dados.rename(columns={'timestamp': 'timestamp_ms'}, inplace=True)
-
-            PONTOS_CONTEXTO = 40
-            primeiro_timestamp_novo = df_novos_dados['timestamp_ms'].iloc[0]
-            sql_contexto = f"SELECT TOP ({PONTOS_CONTEXTO}) x FROM leituras WHERE sessao_id = ? AND timestamp_ms < ? ORDER BY timestamp_ms DESC"
-            cursor.execute(sql_contexto, int(session_id), int(primeiro_timestamp_novo))
-            
-            pontos_x_contexto = [row.x for row in cursor.fetchall()]
-            pontos_x_contexto.reverse()
-
-            sinal_x_completo_para_filtro = pontos_x_contexto + list(df_novos_dados['x'])
-            sinal_x_completo_centralizado = np.array(sinal_x_completo_para_filtro) - np.mean(sinal_x_completo_para_filtro)
-            sinal_filtrado_completo = filtrar_sinal_passa_faixa(sinal_x_completo_centralizado, FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            
-            sinal_filtrado_novos = np.zeros(len(df_novos_dados))
-            if sinal_filtrado_completo.any():
-                inicio_slice = len(pontos_x_contexto)
-                sinal_filtrado_novos = sinal_filtrado_completo[inicio_slice:]
-            # --- Fim do código reintegrado ---
-
-            # 4. Salva as métricas no banco de dados
-            try:
-                sql_insert_analise = """
-                    INSERT INTO analises_janela 
-                        (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
-                    VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
-                """
-                cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico_magnitude, freq_pico_x, freq_pico_y, freq_pico_z)
-            except Exception as db_error:
-                print(f"Erro ao salvar métrica histórica: {db_error}")
-
-            # 5. Prepara o payload final para o dashboard
             payload = {
                 "sessionId": session_id,
                 "metrics": {
-                    "freq_dominante": freq_pico_magnitude, "intensidade_rms": intensidade_rms,
+                    "freq_dominante": freq_pico, "intensidade_rms": intensidade_rms,
                     "total_amostras": total_amostras, "freq_pico_x": freq_pico_x,
                     "freq_pico_y": freq_pico_y, "freq_pico_z": freq_pico_z
                 },
                 "charts": {
-                    "labels": df_novos_dados["timestamp_ms"].tolist(),
+                    "labels": [d['timestamp'] for d in novas_leituras],
                     "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
                     "y": (df_novos_dados['y'] - df_novos_dados['y'].mean()).tolist(),
                     "z": (df_novos_dados['z'] - df_novos_dados['z'].mean()).tolist(),
-                    "sinal_filtrado": sinal_filtrado_novos.tolist() # <<< A CHAVE QUE FALTAVA FOI ADICIONADA
+                    "sinal_filtrado": sinal_filtrado_para_grafico.tolist()
                 }
             }
             socketio.emit('session_update', payload, room=f'session_room_{session_id}')
@@ -175,8 +160,6 @@ def process_and_push_update(session_id, novas_leituras):
             print(f"Erro em process_and_push_update: {e}")
             import traceback
             traceback.print_exc()
-        finally:
-            conn.close()
 
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
@@ -477,21 +460,28 @@ def initial_session_data():
 
         df = pd.DataFrame.from_records(rows, columns=[desc[0] for desc in cursor.description])
         
-        # Análise baseada na magnitude dos 3 eixos
-        df['magnitude'] = np.sqrt(df['x']**2 + df['y']**2 + df['z']**2)
-        sinal_analise_centralizado = df['magnitude'] - df['magnitude'].mean()
-        sinal_analise_filtrado = filtrar_sinal_passa_faixa(sinal_analise_centralizado.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        # 1. Centraliza os eixos para remover a gravidade
+        x_centered = df['x'] - df['x'].mean()
+        y_centered = df['y'] - df['y'].mean()
+        z_centered = df['z'] - df['z'].mean()
         
+        # 2. Calcula a magnitude a partir dos eixos centralizados
+        df['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
+        
+        # 3. Filtra o sinal da magnitude (usando o nome de variável que você prefere)
+        sinal_analise_filtrado = filtrar_sinal_passa_faixa(df['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        
+        # 4. Calcula as métricas finais (o seu código original, que agora está correto neste contexto)
         intensidade_rms = np.sqrt(np.mean(sinal_analise_filtrado**2)) if sinal_analise_filtrado.any() else 0.0
         freq_pico = analisar_frequencia_com_welch(sinal_analise_filtrado, TAXA_AMOSTRAGEM) if sinal_analise_filtrado.any() else 0.0
-
+    
         return jsonify({
             "metrics": {"freq_dominante": freq_pico, "intensidade_rms": intensidade_rms, "total_amostras": total_amostras},
             "charts": {
                 "labels": df["timestamp_ms"].tolist(),
-                "x": (df['x'] - df['x'].mean()).tolist(),
-                "y": (df['y'] - df['y'].mean()).tolist(),
-                "z": (df['z'] - df['z'].mean()).tolist(),
+                "x": x_centered.tolist(),  
+                "y": y_centered.tolist(),
+                "z": z_centered.tolist(),
                 "sinal_filtrado": sinal_analise_filtrado.tolist()
             }
         })

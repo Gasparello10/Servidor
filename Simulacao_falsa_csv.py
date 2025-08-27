@@ -8,7 +8,7 @@ TAXA_AMOSTRAGEM_HZ = 50
 FREQUENCIA_SINAL_HZ = 6.0
 AMPLITUDE_SINAL = 15.0
 GRAVIDADE = 9.8
-NIVEL_RUIDO = 5
+NIVEL_RUIDO = 0
 NOME_ARQUIVO = 'simulacao_20min_6hz.csv'
 # ---------------------------------------------------------
 
@@ -33,8 +33,8 @@ with open(NOME_ARQUIVO, 'w', newline='') as csvfile:
         # --- CORREÇÃO APLICADA AQUI ---
         # Gera o sinal de seno para o eixo Z, somando à gravidade
         sinal_puro_x = AMPLITUDE_SINAL * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ * tempo_atual_seg)
-        sinal_puro_y = AMPLITUDE_SINAL * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ * tempo_atual_seg)
-        sinal_puro_z = AMPLITUDE_SINAL * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ * tempo_atual_seg)
+        sinal_puro_y = AMPLITUDE_SINAL * np.sin(2 * np.pi * 3 * tempo_atual_seg)
+        sinal_puro_z = AMPLITUDE_SINAL * np.sin(2 * np.pi * 5 * tempo_atual_seg)
 
         
         
@@ -45,9 +45,9 @@ with open(NOME_ARQUIVO, 'w', newline='') as csvfile:
         
         # Calcula os valores finais
         timestamp = timestamp_inicial_ms + int(i * INTERVALO_MS)
-        valor_x = GRAVIDADE + sinal_puro_x + ruido_x 
-        valor_y = 0 + ruido_y                  # Eixo Y em repouso
-        valor_z = GRAVIDADE + sinal_puro_z + ruido_z # Tremor aplicado no mesmo eixo da gravidade
+        valor_x =  sinal_puro_x + ruido_x 
+        valor_y =  sinal_puro_y + ruido_y
+        valor_z = GRAVIDADE + sinal_puro_z + ruido_z
         
         writer.writerow([timestamp, f'{valor_x:.4f}', f'{valor_y:.4f}', f'{valor_z:.4f}'])
 
