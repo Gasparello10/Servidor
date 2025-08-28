@@ -184,6 +184,37 @@ def dashboard():
     # Passamos a variável para o template, embora não seja mais usada para polling
     return render_template('dashboard.html', tempo_requisicao_ms=TEMPO_REQUISICAO_MS)
 
+# <<< NOVA ROTA DE API PARA O HISTÓRICO DE BATERIA >>>
+@app.route('/api/battery_history')
+def get_battery_history():
+    session_id = request.args.get('session_id')
+    if not session_id:
+        return jsonify({"error": "session_id não fornecido"}), 400
+    
+    conn = get_db_connection()
+    if not conn:
+        return jsonify({"error": "Falha na conexão com o banco"}), 500
+    
+    cursor = conn.cursor()
+    sql = """
+        SELECT timestamp_leitura, nivel_bateria 
+        FROM leituras_bateria 
+        WHERE sessao_id = ? 
+        ORDER BY timestamp_leitura ASC
+    """
+    try:
+        cursor.execute(sql, int(session_id))
+        rows = cursor.fetchall()
+        # Formata os dados para o Chart.js
+        labels = [row.timestamp_leitura.strftime('%H:%M:%S') for row in rows]
+        data = [row.nivel_bateria for row in rows]
+        return jsonify({"labels": labels, "data": data})
+    except Exception as e:
+        print(f"Erro ao buscar histórico de bateria: {e}")
+        return jsonify({"error": str(e)}), 500
+    finally:
+        conn.close()
+
 @app.route('/api/structure')
 def get_session_structure():
     conn = get_db_connection()
@@ -627,18 +658,33 @@ def handle_register(data):
         print(f"Paciente '{patient_id}' registrado com SID: {request.sid}")
         emit_state_update()
 
+# <<< FUNÇÃO ATUALIZADA PARA SALVAR A BATERIA NO BANCO >>>
 @socketio.on('watch_status_update')
 def handle_watch_status(data):
     patient_id = data.get('patientId')
     battery_level = data.get('batteryLevel')
 
     if patient_id and patient_id in connected_clients:
-        # Atualiza o nível da bateria do paciente
+        # 1. Atualiza o estado em memória (para exibição em tempo real)
         connected_clients[patient_id]['battery'] = battery_level
         print(f"Status do relógio recebido de '{patient_id}': Bateria {battery_level}%")
-        # Envia o estado atualizado para todos os dashboards
-        emit_state_update()
+        
+        # 2. Salva a leitura no banco de dados se houver uma sessão ativa
+        if patient_id in active_sessions:
+            session_id = active_sessions[patient_id].get('session_id')
+            conn = get_db_connection()
+            if conn:
+                try:
+                    cursor = conn.cursor()
+                    sql = "INSERT INTO leituras_bateria (sessao_id, nivel_bateria) VALUES (?, ?)"
+                    cursor.execute(sql, session_id, battery_level)
+                except Exception as e:
+                    print(f"Erro ao salvar leitura de bateria no banco: {e}")
+                finally:
+                    conn.close()
 
+        # 3. Envia o estado atualizado para todos os dashboards
+        emit_state_update()
 
 @socketio.on('disconnect')
 def handle_disconnect():

@@ -149,6 +149,8 @@
                 <button id="toggle-archive-mode-btn" class="action-btn" style="background-color: #ffc107; color: black;">Arquivar Pacientes</button>
                 <button id="show-archived-btn" class="action-btn" style="background-color: #6c757d;">Ver Arquivados</button>
                 <button id="view-history-btn" class="action-btn" style="background-color: #17a2b8; margin-top: 5px;">Ver Histórico</button>
+                <button id="view-battery-btn" class="action-btn" style="background-color: #343a40; margin-top: 5px;">Ver Bateria da Sessão</button>
+                
                 <div id="archive-mode-panel" style="display: none;">
                     <p>Selecione os pacientes para arquivar:</p>
                     <ul id="delete-patient-list"></ul>
@@ -172,6 +174,17 @@
                 </div>
             </div>
             <div id="analysis-content" style="display: none;"></div>
+
+            <div id="battery-view" style="display: none;">
+                    <h2>Histórico de Bateria da Sessão</h2>
+                    <div class="plot-container">
+                        <canvas id="batteryHistoryChart"></canvas>
+                    </div>
+                    <div style="text-align: center; margin-top: 20px;">
+                        <button id="back-to-realtime-from-battery-btn" class="action-btn" style="background-color: #6c757d;">Voltar</button>
+                    </div>
+                </div>
+            </div>
 
             <div id="history-view" style="display: none;">
                 <h2>Análise Histórica do Paciente</h2>
@@ -224,6 +237,7 @@
         let selectedForArchiving = new Set();
         let magnitudeChart, rawChart;
         let historyIntervalChart;
+        let batteryHistoryChart;
 
         const MAX_CHART_POINTS = 200;
 
@@ -246,18 +260,6 @@
         socket.on('session_started', (data) => {
             loadStructure(true, data.patientId, data.sessionId);
         });
-
-        // <<< FUNÇÃO AUXILIAR PARA ATUALIZAR AS MÉTRICAS >>>
-        function updateMetricsDisplay(metrics) {
-            if (!metrics) return;
-            document.getElementById("rms-value").innerText = (metrics.intensidade_rms || 0).toFixed(4);
-            document.getElementById("freq-value").innerText = (metrics.freq_dominante || 0).toFixed(2) + " Hz";
-            document.getElementById("samples-value").innerText = metrics.total_amostras || 0;
-            document.getElementById("freq-x-value").innerText = (metrics.freq_pico_x || 0).toFixed(2) + " Hz";
-            document.getElementById("freq-y-value").innerText = (metrics.freq_pico_y || 0).toFixed(2) + " Hz";
-            document.getElementById("freq-z-value").innerText = (metrics.freq_pico_z || 0).toFixed(2) + " Hz";
-        }
-
         socket.on('session_update', (data) => {
             if (!currentSessionId || data.sessionId != currentSessionId) return;
             
@@ -285,6 +287,78 @@
                 rawChart.update('none');
             }
         });
+
+        // <<< FUNÇÃO AUXILIAR PARA ATUALIZAR AS MÉTRICAS >>>
+        function updateMetricsDisplay(metrics) {
+            if (!metrics) return;
+            document.getElementById("rms-value").innerText = (metrics.intensidade_rms || 0).toFixed(4);
+            document.getElementById("freq-value").innerText = (metrics.freq_dominante || 0).toFixed(2) + " Hz";
+            document.getElementById("samples-value").innerText = metrics.total_amostras || 0;
+            document.getElementById("freq-x-value").innerText = (metrics.freq_pico_x || 0).toFixed(2) + " Hz";
+            document.getElementById("freq-y-value").innerText = (metrics.freq_pico_y || 0).toFixed(2) + " Hz";
+            document.getElementById("freq-z-value").innerText = (metrics.freq_pico_z || 0).toFixed(2) + " Hz";
+        }
+            function initializeBatteryChart() {
+            const ctx = document.getElementById('batteryHistoryChart').getContext('2d');
+            batteryHistoryChart = new Chart(ctx, {
+                type: 'line',
+                data: {
+                    labels: [],
+                    datasets: [{
+                        label: 'Nível da Bateria (%)',
+                        data: [],
+                        borderColor: 'rgba(75, 192, 192, 1)',
+                        backgroundColor: 'rgba(75, 192, 192, 0.2)',
+                        borderWidth: 2,
+                        fill: true,
+                        tension: 0.1
+                    }]
+                },
+                options: {
+                    responsive: true,
+                    scales: {
+                        y: {
+                            beginAtZero: true,
+                            max: 100,
+                            title: { display: true, text: 'Porcentagem (%)' }
+                        },
+                        x: {
+                            title: { display: true, text: 'Horário da Leitura' }
+                        }
+                    }
+                }
+            });
+        }
+
+        
+        function loadBatteryHistory(sessionId) {
+            if (!sessionId) {
+                alert("Por favor, selecione uma sessão primeiro.");
+                return;
+            }
+            
+            // Esconde as outras visualizações e mostra a da bateria
+            document.getElementById('analysis-content').style.display = 'none';
+            document.getElementById('history-view').style.display = 'none';
+            document.querySelector('.main-content > .session-selector').style.display = 'none';
+            document.getElementById('battery-view').style.display = 'block';
+
+            fetch(`/api/battery_history?session_id=${sessionId}`)
+                .then(response => response.json())
+                .then(data => {
+                    if (data.error) {
+                        alert(data.error);
+                        return;
+                    }
+                    batteryHistoryChart.data.labels = data.labels;
+                    batteryHistoryChart.data.datasets[0].data = data.data;
+                    batteryHistoryChart.update();
+                })
+                .catch(err => {
+                    console.error("Erro ao buscar histórico de bateria:", err);
+                    alert("Não foi possível carregar o histórico de bateria.");
+                });
+        }
 
         function updateActiveSessionsList(sessions) {
             const list = document.getElementById('active-sessions-list');
@@ -510,6 +584,7 @@
             initializeCharts();
             initializeHistoryCharts(); 
             updateChartTitles();
+            initializeBatteryChart(); 
             fetch('/api/active_sessions').then(r => r.json()).then(sessions => updateActiveSessionsList(sessions));
             
             const viewHistoryBtn = document.getElementById('view-history-btn');
@@ -553,6 +628,20 @@
                     }
                 });
             });
+            
+            document.getElementById('view-battery-btn').addEventListener('click', () => {
+                const sessionId = document.getElementById('session-select').value;
+                loadBatteryHistory(sessionId);
+            });
+            
+            document.getElementById('back-to-realtime-from-battery-btn').addEventListener('click', () => {
+            document.getElementById('battery-view').style.display = 'none';
+            document.querySelector('.main-content > .session-selector').style.display = 'flex';
+                if (currentSessionId) {
+                    document.getElementById('analysis-content').style.display = 'block';
+                }
+            });
+
             
             document.getElementById('patient-select').addEventListener('change', function() {
                 const patientData = allPatientsData.find(p => p.id == this.value);
