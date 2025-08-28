@@ -544,7 +544,6 @@
             fetch(`/api/initial_session_data?id=${sessionId}`).then(response => response.json()).then(data => {
                 if (data.error) { console.error("Erro:", data.error); return; }
                 
-                // <<< USA A FUNÇÃO AUXILIAR >>>
                 updateMetricsDisplay(data.metrics);
                 
                 if (data.charts && data.charts.labels) {
@@ -577,8 +576,9 @@
             </div>
             <div class="scale-controls"><span>Escala (Dados Brutos): </span><button class="scale-btn active" data-scale="auto">Auto</button><button class="scale-btn" data-scale="5">±5</button><button class="scale-btn" data-scale="10">±10</button><button class="scale-btn" data-scale="15">±15</button><button class="scale-btn" data-scale="20">±20</button></div>
             <div class="plot-container"><h3 id="magnitude-chart-title"></h3><canvas id="magnitudeChart"></canvas></div>
-            <div class="plot-container"><h3 id="raw-chart-title"></h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>
-        `;
+            <div class="plot-container"><h3 id="raw-chart-title"></h3><canvas id="rawChart" style="margin-top: 10px;"></canvas></div>`;
+            
+            
             document.getElementById('analysis-content').innerHTML = analysisContentHTML;
             initializeCharts();
             initializeHistoryCharts(); 

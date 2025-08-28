@@ -17,7 +17,7 @@ from collections import deque
 # CONFIGURAÇÕES GLOBAIS
 # ==========================
 # --- Parâmetros de análise de sinal ---
-TAXA_AMOSTRAGEM = 50              # Hz
+TAXA_AMOSTRAGEM = 25              # Hz
 FREQ_CORTE_BAIXA = 1.0            # Hz
 FREQ_CORTE_ALTA = 8.0             # Hz
 JANELA_DE_ANALISE = 1000          # Nº de amostras para cálculo de RMS e Welch
