@@ -14,6 +14,7 @@ import pyodbc
 from datetime import datetime, timedelta
 import math 
 from collections import deque
+from threading import Lock
 
 # ==========================
 # CONFIGURAÇÕES GLOBAIS
@@ -25,6 +26,7 @@ FREQ_CORTE_ALTA = 8.0             # Hz
 JANELA_DE_ANALISE = 1000          # Nº de amostras para cálculo de RMS e Welch
 NPERSEG_WELCH = 512   
 cache_sessoes = {}
+session_locks = defaultdict(Lock)
 
 # --- Configurações do servidor ---
 HOST = '0.0.0.0'
@@ -81,123 +83,130 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 # =========================================================================
 # <<< FUNÇÃO CORRIGIDA: Lógica de "costura" de sinal para filtro contínuo >>>
 # =========================================================================
+# =========================================================================
+# <<< FUNÇÃO CORRIGIDA: Agora é "thread-safe" para evitar condições de corrida >>>
+# =========================================================================
 def process_and_push_update(session_id, novas_leituras):
     """
     Processa um novo lote de leituras, atualiza a análise e envia para o dashboard.
-    Esta versão é stateless: se o cache da sessão não existir em memória,
-    ele o reconstrói a partir do banco de dados antes de processar os novos dados.
+    Esta versão é stateless e thread-safe:
+    - Se o cache da sessão não existir em memória, ele o reconstrói a partir do banco.
+    - Usa um lock para garantir que os lotes de uma mesma sessão sejam processados em ordem,
+      um de cada vez, evitando condições de corrida.
     """
     if not novas_leituras:
         return
 
-    with app.app_context():
-        try:
-            # --- LÓGICA DE CACHE ADAPTATIVA ---
-            # Se a sessão não está no cache, a recriamos a partir do banco.
-            if session_id not in cache_sessoes:
-                print(f"Cache para sessão {session_id} não encontrado. Recriando a partir do banco de dados...")
-                conn_cache = get_db_connection()
-                if not conn_cache: return
+    # Adquire o lock específico para esta sessão.
+    # Se outra tarefa para a mesma sessão chegar, ela esperará aqui.
+    with session_locks[session_id]:
+        with app.app_context():
+            try:
+                # --- LÓGICA DE CACHE ADAPTATIVA (sem alterações) ---
+                if session_id not in cache_sessoes:
+                    print(f"Cache para sessão {session_id} não encontrado. Recriando a partir do banco de dados...")
+                    conn_cache = get_db_connection()
+                    if not conn_cache: return
 
-                try:
-                    cursor_cache = conn_cache.cursor()
-                    # A query abaixo busca a última janela de dados para preencher o cache inicial.
-                    # Ela seleciona as 'N' leituras mais recentes (definido por JANELA_DE_ANALISE)
-                    # para reconstruir o estado de análise da sessão, caso ele não esteja em memória.
-                    sql_janela = f"""
-                    SELECT TOP ({JANELA_DE_ANALISE}) x, y, z
-                    FROM leituras
-                    WHERE sessao_id = ?
-                    ORDER BY timestamp_ms DESC
-                    """
-                    cursor_cache.execute(sql_janela, session_id)
-                    rows = cursor_cache.fetchall()
-                    rows.reverse() # Ordena do mais antigo para o mais novo
-                    
-                    # Inicializa o cache com os dados históricos
-                    cache_sessoes[session_id] = {
-                        'data': deque([(row.x, row.y, row.z) for row in rows], maxlen=JANELA_DE_ANALISE),
-                        'total_samples': len(rows) # A contagem de amostras recomeça a partir daqui
+                    try:
+                        cursor_cache = conn_cache.cursor()
+                        # A query abaixo busca a última janela de dados para preencher o cache inicial.
+                        # Ela seleciona as 'N' leituras mais recentes (definido por JANELA_DE_ANALISE)
+                        # para reconstruir o estado de análise da sessão, caso ele não esteja em memória.
+                        sql_janela = f"""
+                            SELECT TOP ({JANELA_DE_ANALISE}) x, y, z
+                            FROM leituras
+                            WHERE sessao_id = ?
+                            ORDER BY timestamp_ms DESC
+                        """
+                        cursor_cache.execute(sql_janela, session_id)
+                        rows = cursor_cache.fetchall()
+                        rows.reverse() # Ordena do mais antigo para o mais novo
+                        
+                        # Inicializa o cache com os dados históricos
+                        cache_sessoes[session_id] = {
+                            'data': deque([(row.x, row.y, row.z) for row in rows], maxlen=JANELA_DE_ANALISE),
+                            'total_samples': len(rows) # A contagem de amostras recomeça a partir daqui
+                        }
+                        print(f"Cache para sessão {session_id} recriado com {len(rows)} amostras.")
+                    finally:
+                        conn_cache.close()
+
+                # --- PROCESSAMENTO (continua como antes, mas agora dentro do lock) ---
+                cache = cache_sessoes[session_id]
+                for leitura in novas_leituras:
+                    cache['data'].append((leitura['x'], leitura['y'], leitura['z']))
+                
+                cache['total_samples'] += len(novas_leituras)
+                total_amostras = cache['total_samples']
+                
+                if len(cache['data']) < 100: return
+
+                # Prepara o DataFrame para análise
+                df_analysis = pd.DataFrame(list(cache['data']), columns=['x', 'y', 'z'])
+
+                # Centraliza e calcula a magnitude
+                x_centered = df_analysis['x'] - df_analysis['x'].mean()
+                y_centered = df_analysis['y'] - df_analysis['y'].mean()
+                z_centered = df_analysis['z'] - df_analysis['z'].mean()
+                df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
+                sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+                
+                # Calcula as métricas
+                intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
+                freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
+
+                sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+                freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
+
+                sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+                freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
+
+                sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+                freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
+
+                # Salva as métricas no banco de dados
+                conn = get_db_connection()
+                if conn:
+                    try:
+                        cursor = conn.cursor()
+                        sql_insert_analise = """
+                            INSERT INTO analises_janela 
+                                (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
+                            VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
+                        """
+                        cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
+                    except Exception as db_error:
+                        print(f"Erro ao salvar métrica histórica: {db_error}")
+                    finally:
+                        conn.close()
+
+                # Prepara o payload para o dashboard
+                sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(novas_leituras):]
+                
+                df_novos_dados = pd.DataFrame(novas_leituras)
+                payload = {
+                    "sessionId": session_id,
+                    "metrics": {
+                        "freq_dominante": freq_pico, "intensidade_rms": intensidade_rms,
+                        "total_amostras": total_amostras, "freq_pico_x": freq_pico_x,
+                        "freq_pico_y": freq_pico_y, "freq_pico_z": freq_pico_z
+                    },
+                    "charts": {
+                        "labels": [d['timestamp'] for d in novas_leituras],
+                        "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
+                        "y": (df_novos_dados['y'] - df_novos_dados['y'].mean()).tolist(),
+                        "z": (df_novos_dados['z'] - df_novos_dados['z'].mean()).tolist(),
+                        "sinal_filtrado": sinal_filtrado_para_grafico.tolist()
                     }
-                    print(f"Cache para sessão {session_id} recriado com {len(rows)} amostras.")
-                finally:
-                    conn_cache.close()
-
-            # --- PROCESSAMENTO (continua como antes) ---
-            # 1. Atualiza o cache com os novos dados
-            cache = cache_sessoes[session_id]
-            for leitura in novas_leituras:
-                cache['data'].append((leitura['x'], leitura['y'], leitura['z']))
-            
-            cache['total_samples'] += len(novas_leituras)
-            total_amostras = cache['total_samples']
-            
-            if len(cache['data']) < 100: return
-
-            # 2. Prepara o DataFrame para análise
-            df_analysis = pd.DataFrame(list(cache['data']), columns=['x', 'y', 'z'])
-
-            # 3. Centraliza e calcula a magnitude
-            x_centered = df_analysis['x'] - df_analysis['x'].mean()
-            y_centered = df_analysis['y'] - df_analysis['y'].mean()
-            z_centered = df_analysis['z'] - df_analysis['z'].mean()
-            df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
-            sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            
-            # 4. Calcula as métricas
-            intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
-            freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
-
-            sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
-
-            sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
-
-            sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
-
-            # 5. Salva as métricas no banco de dados
-            conn = get_db_connection()
-            if conn:
-                try:
-                    cursor = conn.cursor()
-                    sql_insert_analise = """
-                        INSERT INTO analises_janela 
-                            (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
-                        VALUES (?, GETDATE(), ?, ?, ?, ?, ?);
-                    """
-                    cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z)
-                except Exception as db_error:
-                    print(f"Erro ao salvar métrica histórica: {db_error}")
-                finally:
-                    conn.close()
-
-            # 6. Prepara o payload para o dashboard
-            sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(novas_leituras):]
-            
-            df_novos_dados = pd.DataFrame(novas_leituras)
-            payload = {
-                "sessionId": session_id,
-                "metrics": {
-                    "freq_dominante": freq_pico, "intensidade_rms": intensidade_rms,
-                    "total_amostras": total_amostras, "freq_pico_x": freq_pico_x,
-                    "freq_pico_y": freq_pico_y, "freq_pico_z": freq_pico_z
-                },
-                "charts": {
-                    "labels": [d['timestamp'] for d in novas_leituras],
-                    "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
-                    "y": (df_novos_dados['y'] - df_novos_dados['y'].mean()).tolist(),
-                    "z": (df_novos_dados['z'] - df_novos_dados['z'].mean()).tolist(),
-                    "sinal_filtrado": sinal_filtrado_para_grafico.tolist()
                 }
-            }
-            socketio.emit('session_update', payload, room=f'session_room_{session_id}')
+                socketio.emit('session_update', payload, room=f'session_room_{session_id}')
 
-        except Exception as e:
-            print(f"Erro em process_and_push_update: {e}")
-            import traceback
-            traceback.print_exc()
+            except Exception as e:
+                print(f"Erro em process_and_push_update: {e}")
+                import traceback
+                traceback.print_exc()
+    # O lock é liberado automaticamente ao sair do bloco 'with'
 
 
 def emit_state_update():
