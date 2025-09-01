@@ -1,3 +1,5 @@
+import eventlet
+eventlet.monkey_patch()
 import os
 import socket
 import time 
@@ -32,7 +34,7 @@ TEMPO_REQUISICAO_MS = 500 # Intervalo entre atualizações no dashboard (ms) - A
 # --- Configurações de banco de dados ---
 CONN_STR = (
     r'DRIVER={ODBC Driver 17 for SQL Server};'
-    r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
+    r'SERVER=localhost;'
     r'DATABASE=AnaliseTremorDB_Teste;'
     r'Trusted_Connection=yes;'
 )
@@ -80,11 +82,48 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 # <<< FUNÇÃO CORRIGIDA: Lógica de "costura" de sinal para filtro contínuo >>>
 # =========================================================================
 def process_and_push_update(session_id, novas_leituras):
-    if not novas_leituras or session_id not in cache_sessoes:
+    """
+    Processa um novo lote de leituras, atualiza a análise e envia para o dashboard.
+    Esta versão é stateless: se o cache da sessão não existir em memória,
+    ele o reconstrói a partir do banco de dados antes de processar os novos dados.
+    """
+    if not novas_leituras:
         return
 
     with app.app_context():
         try:
+            # --- LÓGICA DE CACHE ADAPTATIVA ---
+            # Se a sessão não está no cache, a recriamos a partir do banco.
+            if session_id not in cache_sessoes:
+                print(f"Cache para sessão {session_id} não encontrado. Recriando a partir do banco de dados...")
+                conn_cache = get_db_connection()
+                if not conn_cache: return
+
+                try:
+                    cursor_cache = conn_cache.cursor()
+                    # A query abaixo busca a última janela de dados para preencher o cache inicial.
+                    # Ela seleciona as 'N' leituras mais recentes (definido por JANELA_DE_ANALISE)
+                    # para reconstruir o estado de análise da sessão, caso ele não esteja em memória.
+                    sql_janela = f"""
+                    SELECT TOP ({JANELA_DE_ANALISE}) x, y, z
+                    FROM leituras
+                    WHERE sessao_id = ?
+                    ORDER BY timestamp_ms DESC
+                    """
+                    cursor_cache.execute(sql_janela, session_id)
+                    rows = cursor_cache.fetchall()
+                    rows.reverse() # Ordena do mais antigo para o mais novo
+                    
+                    # Inicializa o cache com os dados históricos
+                    cache_sessoes[session_id] = {
+                        'data': deque([(row.x, row.y, row.z) for row in rows], maxlen=JANELA_DE_ANALISE),
+                        'total_samples': len(rows) # A contagem de amostras recomeça a partir daqui
+                    }
+                    print(f"Cache para sessão {session_id} recriado com {len(rows)} amostras.")
+                finally:
+                    conn_cache.close()
+
+            # --- PROCESSAMENTO (continua como antes) ---
             # 1. Atualiza o cache com os novos dados
             cache = cache_sessoes[session_id]
             for leitura in novas_leituras:
@@ -95,14 +134,13 @@ def process_and_push_update(session_id, novas_leituras):
             
             if len(cache['data']) < 100: return
 
-            # 2. Prepara o DataFrame para análise a partir do cache (100% em memória)
+            # 2. Prepara o DataFrame para análise
             df_analysis = pd.DataFrame(list(cache['data']), columns=['x', 'y', 'z'])
 
-            # 3. Centraliza os eixos ANTES de calcular a magnitude
+            # 3. Centraliza e calcula a magnitude
             x_centered = df_analysis['x'] - df_analysis['x'].mean()
             y_centered = df_analysis['y'] - df_analysis['y'].mean()
             z_centered = df_analysis['z'] - df_analysis['z'].mean()
-            
             df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
             sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             
@@ -119,7 +157,7 @@ def process_and_push_update(session_id, novas_leituras):
             sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
             freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
 
-            # 5. Salva as métricas no banco de dados (tarefa separada)
+            # 5. Salva as métricas no banco de dados
             conn = get_db_connection()
             if conn:
                 try:
@@ -160,6 +198,7 @@ def process_and_push_update(session_id, novas_leituras):
             print(f"Erro em process_and_push_update: {e}")
             import traceback
             traceback.print_exc()
+
 
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
@@ -423,43 +462,65 @@ def restore_patient():
     except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
     finally: conn.close()
 
+# Substitua a função /data existente por esta
+
 @app.route('/data', methods=['POST'])
 def receber_dados():
-    payload = request.get_json()
-    if not payload or 'patientId' not in payload or 'sessao_id' not in payload or 'data' not in payload:
-        return jsonify({"status": "erro", "message": "Payload inválido"}), 400
-    
-    sessao_id = payload['sessao_id']
-    dados_leituras = payload['data']
-    if not dados_leituras:
-        return jsonify({"status": "sucesso", "message": "Nenhum dado para inserir"}), 200
-
-    # Todos os dados são salvos no banco de dados.
-    params = [(sessao_id, l.get('timestamp'), l.get('x'), l.get('y'), l.get('z')) for l in dados_leituras]
-    
-    conn = get_db_connection()
-    if not conn: return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
-    
-    cursor = conn.cursor()
-    sql = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
-    
     try:
-        # A inserção no banco ocorre incondicionalmente.
+        payload = request.get_json()
+        if not payload or 'patientId' not in payload or 'sessao_id' not in payload or 'data' not in payload:
+            return jsonify({"status": "erro", "message": "Payload inválido"}), 400
+
+        sessao_id = int(payload['sessao_id'])
+        dados_leituras = payload['data']
+        
+        if not dados_leituras:
+            return jsonify({"status": "sucesso", "message": "Nenhum dado para inserir"}), 200
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
+        
+        cursor = conn.cursor()
+        
+        # --- VALIDAÇÃO STATELESS ---
+        # 1. Verifica se a sessão realmente existe no banco de dados.
+        cursor.execute("SELECT id FROM sessoes WHERE id = ?", sessao_id)
+        sessao_existente = cursor.fetchone()
+
+        if not sessao_existente:
+            print(f"ERRO: Recebidos dados para uma sessão inexistente (ID: {sessao_id}). Descartando.")
+            # Retorna 404 Not Found, pois o recurso (sessão) não existe.
+            # O WorkManager do Android entenderá isso como um erro e não tentará novamente.
+            return jsonify({"status": "erro", "message": f"Sessão com ID {sessao_id} não encontrada."}), 404
+
+        # 2. Se a sessão existe, insere os dados incondicionalmente.
+        params = [(sessao_id, l.get('timestamp'), l.get('x'), l.get('y'), l.get('z')) for l in dados_leituras]
+        sql = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
         cursor.executemany(sql, params)
         
-        # <<< ALTERAÇÃO: A verificação de tempo foi removida. >>>
-        # A tarefa de processamento e envio para o dashboard agora é chamada para TODOS os lotes de dados.
+        # 3. Dispara a atualização do dashboard em background.
         socketio.start_background_task(
             target=process_and_push_update, 
             session_id=sessao_id, 
             novas_leituras=dados_leituras
         )
         
+        print(f"Sucesso: {len(dados_leituras)} leituras inseridas para a sessão {sessao_id}.")
         return jsonify({"status": "sucesso"}), 201
-    except Exception as e: 
-        return jsonify({"status": "erro", "message": str(e)}), 500
-    finally: 
-        conn.close()
+
+    except pyodbc.Error as db_err:
+        print(f"ERRO DE BANCO DE DADOS em /data: {db_err}")
+        return jsonify({"status": "erro", "message": "Erro de banco de dados"}), 500
+    except Exception as e:
+        import traceback
+        print(f"ERRO INESPERADO em /data: {e}")
+        traceback.print_exc()
+        return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
+            
 # =================================================================================
 # <<< SUBSTITUIÇÃO: Antigo endpoint de polling agora serve apenas dados iniciais >>>
 # =================================================================================
