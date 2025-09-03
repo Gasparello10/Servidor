@@ -83,8 +83,8 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 
 def process_and_push_update(session_id, novas_leituras):
     """
-    Processa um novo lote de leituras, atualiza a análise e envia para o dashboard.
-    VERSÃO REATORADA COM CACHE INTELIGENTE.
+    Processa um lote de dados priorizando a atualização em tempo real,
+    incluindo o sinal filtrado, antes da análise pesada.
     """
     if not novas_leituras:
         return
@@ -92,26 +92,22 @@ def process_and_push_update(session_id, novas_leituras):
     with session_locks[session_id]:
         with app.app_context():
             try:
-                # --- LÓGICA DE RECRIAÇÃO DE CACHE REATORADA ---
+                # Garante que o cache exista (lógica de recriação continua a mesma)
                 if session_id not in cache_sessoes:
+                    # ... (O bloco de recriação de cache que já temos. Cole o seu aqui se precisar)
                     print(f"Cache para sessão {session_id} não encontrado. Recriando do banco...")
                     conn_cache = get_db_connection()
                     if not conn_cache: return
-
                     try:
                         cursor_cache = conn_cache.cursor()
                         cursor_cache.execute("SELECT timestamp_inicio FROM sessoes WHERE id = ?", session_id)
                         sessao_info = cursor_cache.fetchone()
                         if not sessao_info: return
-                        
-                        # A query agora busca o timestamp_ms junto com as coordenadas
                         sql_janela = f"SELECT TOP ({JANELA_DE_ANALISE}) timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
                         cursor_cache.execute(sql_janela, session_id)
                         rows = cursor_cache.fetchall()
                         rows.reverse()
-                        
                         cache_sessoes[session_id] = {
-                            # Armazena dicionários em vez de tuplas
                             'data': deque([{'timestamp': row.timestamp_ms, 'x': row.x, 'y': row.y, 'z': row.z} for row in rows], maxlen=JANELA_DE_ANALISE),
                             'total_samples': len(rows),
                             'start_time_real': sessao_info.timestamp_inicio,
@@ -120,40 +116,75 @@ def process_and_push_update(session_id, novas_leituras):
                         print(f"Cache para sessão {session_id} recriado com {len(rows)} amostras.")
                     finally:
                         conn_cache.close()
-
-                # --- PROCESSAMENTO REATORADO ---
+                
                 cache = cache_sessoes[session_id]
                 
-                # Salva o dicionário completo no cache
+                # Atualiza o cache com os novos dados
                 for leitura in novas_leituras:
                     cache['data'].append(leitura)
-                
                 cache['total_samples'] += len(novas_leituras)
                 
-                # Se for o primeiro lote de dados, define o timestamp de referência
                 if cache['first_sensor_ts'] is None and novas_leituras:
                     cache['first_sensor_ts'] = novas_leituras[0]['timestamp']
 
-                if len(cache['data']) < 100: return
-                
-                # Constrói o DataFrame a partir da lista de dicionários
-                df_analysis = pd.DataFrame(list(cache['data']))
+                # =================================================================
+                # ETAPA 1: ATUALIZAÇÃO RÁPIDA PARA O DASHBOARD (CORRIGIDA)
+                # =================================================================
+                try:
+                    if cache['first_sensor_ts'] is not None and len(cache['data']) > 0:
+                        
+                        # --- CÁLCULO DO SINAL FILTRADO (REINSERIDO AQUI) ---
+                        # Usamos o cache completo para dar contexto ao filtro
+                        df_rapido = pd.DataFrame(list(cache['data']))
+                        x_rapido = df_rapido['x'] - df_rapido['x'].mean()
+                        y_rapido = df_rapido['y'] - df_rapido['y'].mean()
+                        z_rapido = df_rapido['z'] - df_rapido['z'].mean()
+                        magnitude_rapida = np.sqrt(x_rapido**2 + y_rapido**2 + z_rapido**2)
+                        
+                        sinal_filtrado_completo = filtrar_sinal_passa_faixa(magnitude_rapida.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+                        # Pegamos apenas o trecho final do sinal filtrado, correspondente aos novos dados
+                        sinal_filtrado_para_grafico = sinal_filtrado_completo[-len(novas_leituras):].tolist() if sinal_filtrado_completo.any() else []
 
-                # O resto da análise continua igual...
+                        # --- Conversão de timestamp ---
+                        start_time = cache['start_time_real']
+                        first_ts = cache['first_sensor_ts']
+                        labels_reais_ms = [ (start_time + timedelta(microseconds=(d['timestamp'] - first_ts) / 1000)).timestamp() * 1000 for d in novas_leituras ]
+                        
+                        df_novos_dados = pd.DataFrame(novas_leituras)
+                        payload_rapido = {
+                            "sessionId": session_id,
+                            "metrics": {"total_amostras": cache['total_samples']},
+                            "charts": {
+                                "labels": labels_reais_ms,
+                                "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
+                                "y": (df_novos_dados['y'] - df_novos_dados['y'].mean()).tolist(),
+                                "z": (df_novos_dados['z'] - df_novos_dados['z'].mean()).tolist(),
+                                "sinal_filtrado": sinal_filtrado_para_grafico # <<< CORRIGIDO
+                            }
+                        }
+                        socketio.emit('session_update', payload_rapido, room=f'session_room_{session_id}')
+                except Exception as e:
+                    print(f"AVISO: Falha ao emitir atualização rápida para o dashboard: {e}")
+
+
+                # =================================================================
+                # ETAPA 2: ANÁLISE PESADA E SALVAMENTO (BAIXA PRIORIDADE)
+                # =================================================================
+                if len(cache['data']) < 100:
+                    return
+
+                df_analysis = pd.DataFrame(list(cache['data']))
+                
+                # ... (O resto da sua lógica de análise pesada e salvamento no banco continua aqui, sem alterações)
                 x_centered = df_analysis['x'] - df_analysis['x'].mean()
                 y_centered = df_analysis['y'] - df_analysis['y'].mean()
                 z_centered = df_analysis['z'] - df_analysis['z'].mean()
                 df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
                 sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
                 
-                # ... (resto da análise, salvamento no banco e preparação do payload como na versão anterior) ...
-                
-                # (O código para calcular métricas, salvar no banco, converter timestamps e emitir o payload pode ser copiado da sua versão anterior, pois ele já estava funcional antes do bug)
-                # <<< APENAS PARA GARANTIR, AQUI ESTÁ O BLOCO COMPLETO DA PARTE FINAL >>>
-
-                # Calcula métricas
                 intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
                 freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
+                
                 sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
                 freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
                 sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
@@ -161,40 +192,22 @@ def process_and_push_update(session_id, novas_leituras):
                 sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
                 freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
 
-                # Salva a análise no banco
                 conn_insert = get_db_connection()
                 if conn_insert:
                     try:
                         cursor_insert = conn_insert.cursor()
                         ultimo_timestamp_sensor = df_analysis['timestamp'].iloc[-1]
                         sql_insert_analise = """
-                            INSERT INTO analises_janela 
-                                (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms)
-                            VALUES (?, GETDATE(), ?, ?, ?, ?, ?, ?);
-                        """
+                            INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms)
+                            VALUES (?, GETDATE(), ?, ?, ?, ?, ?, ?);"""
                         cursor_insert.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, int(ultimo_timestamp_sensor))
                     finally:
                         conn_insert.close()
-
-                # Prepara o payload para o dashboard
-                start_time = cache['start_time_real']
-                first_ts = cache['first_sensor_ts']
-                labels_reais_ms = []
-                for d in novas_leituras:
-                    delta_nanos = d['timestamp'] - first_ts
-                    delta = timedelta(microseconds=delta_nanos / 1000)
-                    real_time = start_time + delta
-                    labels_reais_ms.append(real_time.timestamp() * 1000)
-
-                sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(novas_leituras):]
-                payload = { "sessionId": session_id, "metrics": { "freq_dominante": freq_pico, "intensidade_rms": intensidade_rms, "total_amostras": cache['total_samples'], "freq_pico_x": freq_pico_x, "freq_pico_y": freq_pico_y, "freq_pico_z": freq_pico_z }, "charts": { "labels": labels_reais_ms, "x": x_centered.iloc[-len(novas_leituras):].tolist(), "y": y_centered.iloc[-len(novas_leituras):].tolist(), "z": z_centered.iloc[-len(novas_leituras):].tolist(), "sinal_filtrado": sinal_filtrado_para_grafico.tolist() } }
-                socketio.emit('session_update', payload, room=f'session_room_{session_id}')
 
             except Exception as e:
                 print(f"Erro em process_and_push_update: {e}")
                 import traceback
                 traceback.print_exc()
-
 
 def process_final_batch(session_id):
     """
