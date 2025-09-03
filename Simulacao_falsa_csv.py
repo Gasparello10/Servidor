@@ -3,53 +3,66 @@ import numpy as np
 import time
 
 # --- Parâmetros da Simulação ---
-DURACAO_MINUTOS = 60
+DURACAO_MINUTOS = 1
 TAXA_AMOSTRAGEM_HZ = 50
-FREQUENCIA_SINAL_HZ = 6.0
+FREQUENCIA_SINAL_HZ = 1.0
 AMPLITUDE_SINAL = 15.0
 GRAVIDADE = 9.8
 NIVEL_RUIDO = 0
+ATRASO_INICIAL_SEGUNDOS = 5
 NOME_ARQUIVO = 'simulacao_20min_6hz.csv'
 # ---------------------------------------------------------
 
-# --- Cálculos ---
+print(f"Gerando dados para o arquivo '{NOME_ARQUIVO}'...")
+
+# --- 1. Geração de Dados em Lote (Batch) ---
+
+# Calcula o número total de amostras e as amostras de atraso
 DURACAO_SEGUNDOS = DURACAO_MINUTOS * 60
 TOTAL_AMOSTRAS = DURACAO_SEGUNDOS * TAXA_AMOSTRAGEM_HZ
-INTERVALO_MS = 1000 / TAXA_AMOSTRAGEM_HZ
+AMOSTRAS_ATRASO = ATRASO_INICIAL_SEGUNDOS * TAXA_AMOSTRAGEM_HZ
+AMOSTRAS_SINAL = TOTAL_AMOSTRAS - AMOSTRAS_ATRASO
 
-print(f"Gerando arquivo '{NOME_ARQUIVO}'...")
-print(f"Duração: {DURACAO_MINUTOS} minutos")
-print(f"Total de amostras: {TOTAL_AMOSTRAS}")
+# Cria o vetor de tempo para a parte do SINAL
+# (começa do zero para o início da onda senoidal)
+tempo_sinal_seg = np.arange(AMOSTRAS_SINAL) / TAXA_AMOSTRAGEM_HZ
+
+# Gera todos os valores do sinal de uma vez (vetorização)
+sinal_puro_x = AMPLITUDE_SINAL * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ * tempo_sinal_seg)
+sinal_puro_y = AMPLITUDE_SINAL * np.sin(2 * np.pi * 3 * tempo_sinal_seg)
+sinal_puro_z = AMPLITUDE_SINAL * np.sin(2 * np.pi * 5 * tempo_sinal_seg)
+
+# Cria os arrays de "silêncio" (zeros)
+atraso_x = np.zeros(AMOSTRAS_ATRASO)
+atraso_y = np.zeros(AMOSTRAS_ATRASO)
+atraso_z = np.zeros(AMOSTRAS_ATRASO)
+
+# Junta os arrays: atraso no início, sinal depois
+valor_x_final = np.concatenate([atraso_x, sinal_puro_x])
+valor_y_final = np.concatenate([atraso_y, sinal_puro_y])
+valor_z_final = np.concatenate([atraso_z, sinal_puro_z])
+
+# Adiciona a gravidade ao eixo Z (ruído pode ser adicionado aqui também)
+valor_z_final += GRAVIDADE
+
+print(f"Dados gerados. Escrevendo no arquivo...")
+
+# --- 2. Escrita dos Dados no Arquivo ---
 
 timestamp_inicial_ms = int(time.time() * 1000)
+INTERVALO_MS = 1000 / TAXA_AMOSTRAGEM_HZ
 
 with open(NOME_ARQUIVO, 'w', newline='') as csvfile:
     writer = csv.writer(csvfile)
     writer.writerow(['timestamp', 'x', 'y', 'z'])
     
     for i in range(TOTAL_AMOSTRAS):
-        tempo_atual_seg = i / TAXA_AMOSTRAGEM_HZ
-        
-        # --- CORREÇÃO APLICADA AQUI ---
-        # Gera o sinal de seno para o eixo Z, somando à gravidade
-        sinal_puro_x = AMPLITUDE_SINAL * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ * tempo_atual_seg)
-        sinal_puro_y = AMPLITUDE_SINAL * np.sin(2 * np.pi * 3 * tempo_atual_seg)
-        sinal_puro_z = AMPLITUDE_SINAL * np.sin(2 * np.pi * 5 * tempo_atual_seg)
-
-        
-        
-        # Adiciona ruído (atualmente zero)
-        ruido_x = np.random.uniform(-NIVEL_RUIDO, NIVEL_RUIDO)
-        ruido_y = np.random.uniform(-NIVEL_RUIDO, NIVEL_RUIDO)
-        ruido_z = np.random.uniform(-NIVEL_RUIDO, NIVEL_RUIDO)
-        
-        # Calcula os valores finais
         timestamp = timestamp_inicial_ms + int(i * INTERVALO_MS)
-        valor_x =  sinal_puro_x + ruido_x 
-        valor_y =  sinal_puro_y + ruido_y
-        valor_z = GRAVIDADE + sinal_puro_z + ruido_z
-        
-        writer.writerow([timestamp, f'{valor_x:.4f}', f'{valor_y:.4f}', f'{valor_z:.4f}'])
+        writer.writerow([
+            timestamp, 
+            f'{valor_x_final[i]:.4f}', 
+            f'{valor_y_final[i]:.4f}', 
+            f'{valor_z_final[i]:.4f}'
+        ])
 
 print(f"\nArquivo '{NOME_ARQUIVO}' gerado com sucesso!")
-
