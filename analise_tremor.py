@@ -24,8 +24,10 @@ TAXA_AMOSTRAGEM = 25              # Hz
 FREQ_CORTE_BAIXA = 1.0            # Hz
 FREQ_CORTE_ALTA = 8.0             # Hz
 JANELA_DE_ANALISE = 1000          # Nº de amostras para cálculo de RMS e Welch
-NPERSEG_WELCH = 512   
-cache_sessoes = {}
+NPERSEG_WELCH = 512 
+
+# <<< ALTERAÇÃO: O cache global foi removido. Era a fonte do problema de contaminação de dados. >>>
+# cache_sessoes = {}
 session_locks = defaultdict(Lock)
 
 # --- Configurações do servidor ---
@@ -53,7 +55,6 @@ app = Flask(__name__)
 # Certifique-se de que o async_mode é compatível com o seu servidor de produção (eventlet/gevent)
 socketio = SocketIO(app, async_mode="eventlet", ping_timeout=20, ping_interval=10)
 connected_clients = {}
-# <<< NOVO >>> Dicionário para rastrear sessões ativas em tempo real
 # Formato: { 'paciente_nome': {'patient_id': 1, 'session_id': 10, 'patient_name': 'nome'} }
 active_sessions = {}
 
@@ -81,50 +82,56 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
     return freqs[pico_idx]
 
 
+# =================================================================================
+# <<< ALTERAÇÃO: Função de análise reescrita para ser "Stateless" (sem cache) >>>
+# =================================================================================
 def process_and_push_update(session_id, novas_leituras):
     """
-    Processa um lote de dados, calcula as métricas, envia a atualização completa
-    para o dashboard e salva a análise no banco de dados quando apropriado.
+    Processa um lote de dados de forma "stateless", buscando o contexto histórico
+    necessário do banco de dados para cada execução, evitando contaminação de cache.
     """
     if not novas_leituras:
         return
 
+    # Garante que o lote atual está em ordem para pegar o timestamp inicial correto
+    novas_leituras.sort(key=lambda x: x['timestamp'])
+
     with session_locks[session_id]:
         with app.app_context():
             try:
-                # Lógica de recriação de cache (sem alterações)
-                if session_id not in cache_sessoes:
-                    print(f"Cache para sessão {session_id} não encontrado. Recriando do banco...")
-                    conn_cache = get_db_connection()
-                    if not conn_cache: return
-                    try:
-                        cursor_cache = conn_cache.cursor()
-                        sql_janela = f"SELECT TOP ({JANELA_DE_ANALISE}) timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
-                        cursor_cache.execute(sql_janela, session_id)
-                        rows = cursor_cache.fetchall()
-                        rows.reverse()
-                        cache_sessoes[session_id] = {
-                            'data': deque([{'timestamp': row.timestamp_ms, 'x': row.x, 'y': row.y, 'z': row.z} for row in rows], maxlen=JANELA_DE_ANALISE),
-                            'total_samples': len(rows)
-                        }
-                        print(f"Cache para sessão {session_id} recriado com {len(rows)} amostras.")
-                    finally:
-                        conn_cache.close()
+                # --- 1. Busca o contexto histórico do banco de dados ---
+                min_ts_in_chunk = novas_leituras[0]['timestamp']
+                num_leituras_necessarias_db = JANELA_DE_ANALISE - len(novas_leituras)
                 
-                cache = cache_sessoes[session_id]
-                for leitura in novas_leituras:
-                    cache['data'].append(leitura)
-                cache['total_samples'] += len(novas_leituras)
+                leituras_contexto_db = []
+                if num_leituras_necessarias_db > 0:
+                    conn_context = get_db_connection()
+                    if not conn_context: return
+                    try:
+                        cursor_context = conn_context.cursor()
+                        # Busca as leituras imediatamente anteriores a este lote
+                        sql_context = f"""
+                            SELECT TOP ({num_leituras_necessarias_db}) timestamp_ms, x, y, z 
+                            FROM leituras 
+                            WHERE sessao_id = ? AND timestamp_ms < ? 
+                            ORDER BY timestamp_ms DESC
+                        """
+                        cursor_context.execute(sql_context, session_id, min_ts_in_chunk)
+                        rows = cursor_context.fetchall()
+                        rows.reverse()  # Reordena do mais antigo para o mais novo
+                        leituras_contexto_db = [{'timestamp': r.timestamp_ms, 'x': r.x, 'y': r.y, 'z': r.z} for r in rows]
+                    finally:
+                        conn_context.close()
 
-                # Condição de guarda: precisamos de um mínimo de dados para o filtro funcionar
-                if len(cache['data']) < 34: 
+                # --- 2. Constrói uma janela de análise limpa e cronológica ---
+                janela_completa = leituras_contexto_db + novas_leituras
+                
+                if len(janela_completa) < 34:
                     return
 
-                # --- ANÁLISE UNIFICADA ---
-                # Construímos o DataFrame a partir do cache completo para garantir precisão
-                df_analysis = pd.DataFrame(list(cache['data']))
+                # --- 3. ANÁLISE UNIFICADA ---
+                df_analysis = pd.DataFrame(janela_completa)
                 
-                # Processamento do sinal
                 x_centered = df_analysis['x'] - df_analysis['x'].mean()
                 y_centered = df_analysis['y'] - df_analysis['y'].mean()
                 z_centered = df_analysis['z'] - df_analysis['z'].mean()
@@ -135,14 +142,25 @@ def process_and_push_update(session_id, novas_leituras):
                 sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
                 sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
 
-                # Cálculo das métricas
                 intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
                 freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
                 freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
                 freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
                 freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
                 
-                # --- PREPARAÇÃO DO PAYLOAD COMPLETO PARA O DASHBOARD ---
+                # --- 4. PREPARAÇÃO DO PAYLOAD PARA O DASHBOARD ---
+                total_samples = 0
+                conn_count = get_db_connection()
+                if conn_count:
+                    try:
+                        cursor_count = conn_count.cursor()
+                        cursor_count.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", session_id)
+                        total_samples_tuple = cursor_count.fetchone()
+                        if total_samples_tuple:
+                            total_samples = total_samples_tuple[0]
+                    finally:
+                        conn_count.close()
+
                 sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(novas_leituras):].tolist() if sinal_magnitude_filtrado.any() else []
                 df_novos_dados = pd.DataFrame(novas_leituras)
                 labels_reais_ms = [d['timestamp'] for d in novas_leituras]
@@ -150,9 +168,9 @@ def process_and_push_update(session_id, novas_leituras):
                 payload = {
                     "sessionId": session_id,
                     "metrics": {
-                        "total_amostras": cache['total_samples'],
+                        "total_amostras": total_samples,
                         "intensidade_rms": intensidade_rms,
-                        "freq_dominante": freq_pico, # A chave para a freq. total no frontend
+                        "freq_dominante": freq_pico,
                         "freq_pico_x": freq_pico_x,
                         "freq_pico_y": freq_pico_y,
                         "freq_pico_z": freq_pico_z
@@ -167,93 +185,48 @@ def process_and_push_update(session_id, novas_leituras):
                 }
                 socketio.emit('session_update', payload, room=f'session_room_{session_id}')
 
-                # --- SALVAMENTO NO BANCO DE DADOS (QUANDO A CONDIÇÃO É ATINGIDA) ---
-                if len(cache['data']) >= 100:
-                    conn_insert = get_db_connection()
-                    if conn_insert:
-                        try:
-                            cursor_insert = conn_insert.cursor()
-                            ultimo_timestamp_sensor = int(df_analysis['timestamp'].iloc[-1])
-                            sql_insert_analise = """
-                                INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms)
-                                VALUES (?, GETDATE(), ?, ?, ?, ?, ?, ?);"""
-                            # <<< CORREÇÃO: Usando as variáveis calculadas em vez de zeros >>>
-                            cursor_insert.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, ultimo_timestamp_sensor)
-                        finally:
-                            conn_insert.close()
-                
+                # --- 5. SALVAMENTO DA ANÁLISE NO BANCO DE DADOS ---
+                conn_insert = get_db_connection()
+                if conn_insert:
+                    try:
+                        cursor_insert = conn_insert.cursor()
+                        ultimo_timestamp_sensor = int(df_analysis['timestamp'].iloc[-1])
+                        sql_insert_analise = """
+                            INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms)
+                            VALUES (?, GETUTCDATE(), ?, ?, ?, ?, ?, ?);"""
+                        cursor_insert.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, ultimo_timestamp_sensor)
+                    finally:
+                        conn_insert.close()
             except Exception as e:
                 print(f"Erro em process_and_push_update: {e}")
                 import traceback
                 traceback.print_exc()
 
-
-
+# <<< ALTERAÇÃO: Função de análise final adaptada para o modelo stateless >>>
 def process_final_batch(session_id):
-    """
-    Executa uma análise final nos dados restantes no cache de uma sessão
-    antes de ela ser encerrada, garantindo que nenhum dado seja perdido.
-    VERSÃO CORRIGIDA E ROBUSTA.
-    """
     print(f"Executando análise final para a sessão {session_id}...")
-    
-    with session_locks[session_id]:
-        if session_id not in cache_sessoes:
-            print(f"Cache para a sessão {session_id} não encontrado para análise final.")
-            return
-
-        cache = cache_sessoes[session_id]
-        
-        if len(cache['data']) < 34: 
-            print("Dados insuficientes no cache para a análise final.")
-            return
-
-        try:
-            # Constrói o DataFrame a partir da lista de dicionários no cache
-            df_analysis = pd.DataFrame(list(cache['data']))
-
-            x_centered = df_analysis['x'] - df_analysis['x'].mean()
-            y_centered = df_analysis['y'] - df_analysis['y'].mean()
-            z_centered = df_analysis['z'] - df_analysis['z'].mean()
-            df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
-            
-            sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            
-            # Calcula as métricas
-            intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
-            freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
-            # ... (cálculos de freq x, y, z) ...
-            sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
-            sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
-            sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-            freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
-
-            # Pega o último timestamp real diretamente do cache - SEM APROXIMAÇÕES
-            ultimo_timestamp_sensor = df_analysis['timestamp'].iloc[-1]
-
-            conn = get_db_connection()
-            if conn:
-                try:
-                    cursor = conn.cursor()
-                    sql_insert_analise = """
-                        INSERT INTO analises_janela 
-                            (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms)
-                        VALUES (?, GETDATE(), ?, ?, ?, ?, ?, ?);
-                    """
-                    cursor.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, int(ultimo_timestamp_sensor))
-                    print(f"Análise final para a sessão {session_id} salva no banco.")
-                finally:
-                    conn.close()
-        except Exception as e:
+    conn = get_db_connection()
+    if not conn: return
+    try:
+        cursor = conn.cursor()
+        # Pega o último pedaço de dados que talvez não tenha formado um lote completo de análise
+        sql_last_data = f"SELECT TOP ({250}) timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
+        cursor.execute(sql_last_data, session_id)
+        rows = cursor.fetchall()
+        rows.reverse()
+        if rows:
+            last_readings = [{'timestamp': r.timestamp_ms, 'x': r.x, 'y': r.y, 'z': r.z} for r in rows]
+            process_and_push_update(session_id, last_readings)
+            print(f"Análise final para a sessão {session_id} concluída.")
+    except Exception as e:
             print(f"Erro CRÍTICO durante a análise final da sessão {session_id}: {e}")
             import traceback
             traceback.print_exc()
+    finally:
+        conn.close()
 
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
-    # Transforma o dicionário complexo em uma lista simples para o frontend
     online_patients_list = []
     for name, data in connected_clients.items():
         online_patients_list.append({
@@ -271,7 +244,6 @@ def emit_state_update():
 # --- Endpoints HTTP ---
 @app.route('/')
 def dashboard():
-    # Passamos a variável para o template, embora não seja mais usada para polling
     return render_template('dashboard.html', tempo_requisicao_ms=TEMPO_REQUISICAO_MS)
 
 @app.route('/battery_data', methods=['POST'])
@@ -296,10 +268,8 @@ def receber_dados_bateria():
         
         cursor = conn.cursor()
         
-        # Prepara os parâmetros para inserção em lote
         params = []
         for leitura in dados_bateria:
-            # Converte o timestamp Unix (em milissegundos) para um objeto datetime
             ts_unix = leitura.get('timestamp') / 1000
             ts_datetime = datetime.fromtimestamp(ts_unix)
             params.append((sessao_id, ts_datetime, leitura.get('batteryLevel')))
@@ -319,7 +289,6 @@ def receber_dados_bateria():
         if 'conn' in locals() and conn:
             conn.close()
 
-# <<< NOVA ROTA DE API PARA O HISTÓRICO DE BATERIA >>>
 @app.route('/api/battery_history')
 def get_battery_history():
     session_id = request.args.get('session_id')
@@ -452,8 +421,6 @@ def get_historical_data():
     response_data = {"daily_summary": [], "interval_summary": []}
     
     try:
-        # --- CORREÇÃO PRINCIPAL: usar MILISSEGUNDOS ---
-        
         # 1. Converte as datas de string para objetos datetime
         start_date_obj = datetime.strptime(start_date_str, '%Y-%m-%d')
         end_date_obj = datetime.strptime(end_date_str, '%Y-%m-%d') + timedelta(days=1)  # O final é exclusivo
@@ -539,7 +506,7 @@ def get_historical_data():
                 final_series = interval_map.reindex(full_day_intervals, fill_value=None)
 
                 response_data["interval_summary"] = [
-                    {"label": ts.strftime('%H:%M'), "avg_rms": value if pd.notna(value) else 0}
+                    {"label": int(ts.timestamp() * 1000), "avg_rms": value if pd.notna(value) else 0}
                     for ts, value in final_series.items()
                 ]
 
@@ -553,31 +520,9 @@ def get_historical_data():
         if conn:
             conn.close()
 
-# <<< NOVO >>> Endpoint para obter a lista de sessões ativas
-@app.route('/api/active_sessions')
-def get_active_sessions():
-    # Retorna a lista de valores do nosso dicionário de controle
-    return jsonify(list(active_sessions.values()))
 
-@app.route('/api/restore_patient', methods=['POST'])
-def restore_patient():
-    data = request.get_json()
-    patient_id = data.get('patientId')
-    if not patient_id: return jsonify({"status": "erro", "message": "ID não fornecido"}), 400
-    conn = get_db_connection()
-    if not conn: return jsonify({"status": "erro", "message": "Falha na conexão"}), 500
-    cursor = conn.cursor()
-    sql = "UPDATE pacientes SET esta_ativo = 1 WHERE id = ?"
-    try:
-        cursor.execute(sql, patient_id)
-        print(f"Paciente com ID {patient_id} restaurado com sucesso.")
-        socketio.emit('structure_changed')
-        return jsonify({"status": "sucesso", "message": f"Paciente {patient_id} restaurado."})
-    except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
-    finally: conn.close()
 
-# Substitua a função /data existente por esta
-
+# <<< ALTERAÇÃO: Rota de dados modificada para fatiar pacotes grandes >>>
 @app.route('/data', methods=['POST'])
 def receber_dados():
     try:
@@ -591,37 +536,47 @@ def receber_dados():
         if not dados_leituras:
             return jsonify({"status": "sucesso", "message": "Nenhum dado para inserir"}), 200
 
+        # Valida os dados para garantir que tenham timestamp
+        leituras_validas = [l for l in dados_leituras if l.get('timestamp') and isinstance(l.get('timestamp'), (int, float)) and l.get('timestamp') > 0]
+        if len(leituras_validas) != len(dados_leituras):
+            print(f"AVISO: {len(dados_leituras) - len(leituras_validas)} leituras descartadas por timestamp inválido na sessão {sessao_id}.")
+        if not leituras_validas:
+            return jsonify({"status": "sucesso", "message": "Nenhum dado válido para inserir"}), 200
+
         conn = get_db_connection()
         if not conn:
             return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
         
-        cursor = conn.cursor()
-        
-        # --- VALIDAÇÃO STATELESS ---
-        # 1. Verifica se a sessão realmente existe no banco de dados.
-        cursor.execute("SELECT id FROM sessoes WHERE id = ?", sessao_id)
-        sessao_existente = cursor.fetchone()
+        try:
+            cursor = conn.cursor()
+            
+            cursor.execute("SELECT id FROM sessoes WHERE id = ?", sessao_id)
+            if not cursor.fetchone():
+                return jsonify({"status": "erro", "message": f"Sessão com ID {sessao_id} não encontrada."}), 404
 
-        if not sessao_existente:
-            print(f"ERRO: Recebidos dados para uma sessão inexistente (ID: {sessao_id}). Descartando.")
-            # Retorna 404 Not Found, pois o recurso (sessão) não existe.
-            # O WorkManager do Android entenderá isso como um erro e não tentará novamente.
-            return jsonify({"status": "erro", "message": f"Sessão com ID {sessao_id} não encontrada."}), 404
+            # Salva todos os dados brutos de uma vez
+            params = [(sessao_id, int(l['timestamp']), l.get('x'), l.get('y'), l.get('z')) for l in leituras_validas]
+            sql = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
+            cursor.executemany(sql, params)
+            
+            # Processa os dados em pedaços para gerar análises granulares
+            TAMANHO_LOTE_ANALISE = 250  # Processa a cada 10 segundos de dados (250 amostras)
+            leituras_validas.sort(key=lambda x: x['timestamp'])
 
-        # 2. Se a sessão existe, insere os dados incondicionalmente.
-        params = [(sessao_id, l.get('timestamp'), l.get('x'), l.get('y'), l.get('z')) for l in dados_leituras]
-        sql = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
-        cursor.executemany(sql, params)
-        
-        # 3. Dispara a atualização do dashboard em background.
-        socketio.start_background_task(
-            target=process_and_push_update, 
-            session_id=sessao_id, 
-            novas_leituras=dados_leituras
-        )
-        
-        print(f"Sucesso: {len(dados_leituras)} leituras inseridas para a sessão {sessao_id}.")
-        return jsonify({"status": "sucesso"}), 201
+            for i in range(0, len(leituras_validas), TAMANHO_LOTE_ANALISE):
+                chunk = leituras_validas[i:i + TAMANHO_LOTE_ANALISE]
+                socketio.start_background_task(
+                    target=process_and_push_update, 
+                    session_id=sessao_id, 
+                    novas_leituras=chunk
+                )
+            
+            print(f"Sucesso: {len(leituras_validas)} leituras inseridas e agendadas para análise para a sessão {sessao_id}.")
+            return jsonify({"status": "sucesso"}), 201
+
+        finally:
+            if conn:
+                conn.close()
 
     except pyodbc.Error as db_err:
         print(f"ERRO DE BANCO DE DADOS em /data: {db_err}")
@@ -631,14 +586,7 @@ def receber_dados():
         print(f"ERRO INESPERADO em /data: {e}")
         traceback.print_exc()
         return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
-    finally:
-        if 'conn' in locals() and conn:
-            conn.close()
-            
-# =================================================================================
-# <<< SUBSTITUIÇÃO: Antigo endpoint de polling agora serve apenas dados iniciais >>>
-# =================================================================================
-
+        
 @app.route('/api/initial_session_data')
 def initial_session_data():
     session_id = request.args.get('id')
@@ -649,7 +597,6 @@ def initial_session_data():
     cursor = conn.cursor()
 
     try:
-        # <<< SIMPLIFICAÇÃO: Não precisamos mais do start_time_real nesta rota >>>
         sql_completo = "SELECT timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms ASC"
         cursor.execute(sql_completo, int(session_id))
         rows = cursor.fetchall()
@@ -665,7 +612,6 @@ def initial_session_data():
         df = pd.DataFrame.from_records(rows, columns=[desc[0] for desc in cursor.description])
         total_amostras = len(df)
         
-        # <<< SIMPLIFICAÇÃO: A conversão complexa de tempo foi removida >>>
         labels_reais_ms = df["timestamp_ms"].tolist()
         
         x_centered = df['x'] - df['x'].mean()
@@ -726,11 +672,7 @@ def start_session():
         cursor.execute("INSERT INTO sessoes (paciente_id, timestamp_inicio) OUTPUT INSERTED.id VALUES (?, GETDATE())", paciente_id)
         nova_sessao_id = cursor.fetchone().id
     
-        # <<< CORREÇÃO: Cache simplificado. Não precisa mais de referências de tempo. >>>
-        cache_sessoes[nova_sessao_id] = {
-            'data': deque(maxlen=JANELA_DE_ANALISE),
-            'total_samples': 0
-        }
+        # <<< ALTERAÇÃO: A inicialização do cache foi removida daqui. >>>
 
         active_sessions[patient_name_for_dict] = {
             'patient_id': paciente_id,
@@ -750,7 +692,6 @@ def start_session():
 @app.route('/api/stop_session', methods=['POST'])
 def stop_session():
     data = request.get_json()
-    # O frontend deve enviar o NOME do paciente, que é a chave dos dicionários.
     patient_name = data.get('patientId') 
     
     print(f"\n--- TENTATIVA DE PARAR SESSÃO para o paciente: '{patient_name}' ---")
@@ -759,26 +700,21 @@ def stop_session():
         print("[ERRO] 'patientId' (nome do paciente) não foi fornecido no corpo da requisição.")
         return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
     
-    # Passo 1: Verificar se o paciente está na lista de clientes conectados via WebSocket
     client_data = connected_clients.get(patient_name)
     if not client_data:
-        print(f"[AVISO] Paciente '{patient_name}' não encontrado em `connected_clients`. A sessão pode já ter sido encerrada ou o paciente desconectou.")
-        # Mesmo que não esteja conectado, tentaremos limpar a sessão ativa para corrigir o estado do servidor.
+        print(f"[AVISO] Paciente '{patient_name}' não encontrado em `connected_clients`.")
     
-    # Passo 2: Verificar se há uma sessão ativa registrada para este paciente
     if patient_name not in active_sessions:
-        print(f"[AVISO] Nenhuma sessão ativa encontrada para '{patient_name}' no dicionário `active_sessions`. Apenas atualizando a interface.")
+        print(f"[AVISO] Nenhuma sessão ativa encontrada para '{patient_name}'.")
         emit_state_update()
         socketio.emit('structure_changed')
         return jsonify({"status": "sucesso", "message": "Nenhuma sessão ativa para parar, estado da UI atualizado."})
 
-    # Se chegamos aqui, existe uma sessão ativa. Vamos processá-la.
     session_info = active_sessions[patient_name]
     session_id_to_stop = session_info.get('session_id')
     
     print(f"Sessão ativa encontrada: ID {session_id_to_stop} para o paciente '{patient_name}'.")
 
-    # Passo 3: Enviar comando de parada para o dispositivo móvel, se ele estiver conectado
     if client_data and 'sid' in client_data:
         sid = client_data['sid']
         socketio.emit('stop_monitoring', room=sid)
@@ -786,27 +722,18 @@ def stop_session():
     else:
         print("Nenhum cliente conectado encontrado para enviar o comando 'stop_monitoring'.")
 
-    # Passo 4: Processar os dados finais em cache e limpar o cache
-    if session_id_to_stop in cache_sessoes:
-        # Usar start_background_task para não bloquear a resposta HTTP
-        socketio.start_background_task(process_final_batch, session_id_to_stop)
-        del cache_sessoes[session_id_to_stop]
-        print(f"Análise final para a sessão {session_id_to_stop} agendada e cache limpo.")
-
-    # Passo 5: Remover a sessão da lista de sessões ativas
+    # <<< ALTERAÇÃO: A lógica de cache foi removida daqui, apenas a análise final é chamada. >>>
+    socketio.start_background_task(process_final_batch, session_id_to_stop)
+    
     del active_sessions[patient_name]
     print(f"Sessão do paciente '{patient_name}' removida da lista de ativas.")
 
-    # Passo 6: Notificar todos os dashboards da mudança de estado
     emit_state_update()
     socketio.emit('structure_changed')
     
     print("--- FIM DA OPERAÇÃO DE PARADA DE SESSÃO ---")
     return jsonify({"status": "sucesso", "message": "Comando de parada processado."})
 
-# =============================================================
-# <<< ALTERAÇÃO: Novos handlers para inscrição nos canais da sessão >>>
-# =============================================================
 @socketio.on('connect')
 def handle_connect(): print(f"Novo cliente conectado: {request.sid}")
 
@@ -834,23 +761,19 @@ def handle_join_dashboard():
 def handle_register(data):
     patient_id = data.get('patientId')
     if patient_id:
-        # Armazena o sid e um valor inicial para a bateria
         connected_clients[patient_id] = {'sid': request.sid, 'battery': None}
         print(f"Paciente '{patient_id}' registrado com SID: {request.sid}")
         emit_state_update()
 
-# <<< FUNÇÃO ATUALIZADA PARA SALVAR A BATERIA NO BANCO >>>
 @socketio.on('watch_status_update')
 def handle_watch_status(data):
     patient_id = data.get('patientId')
     battery_level = data.get('batteryLevel')
 
     if patient_id and patient_id in connected_clients:
-        # 1. Atualiza o estado em memória (para exibição em tempo real)
         connected_clients[patient_id]['battery'] = battery_level
         print(f"Status do relógio recebido de '{patient_id}': Bateria {battery_level}%")
         
-        # 2. Salva a leitura no banco de dados se houver uma sessão ativa
         if patient_id in active_sessions:
             session_id = active_sessions[patient_id].get('session_id')
             conn = get_db_connection()
@@ -864,7 +787,6 @@ def handle_watch_status(data):
                 finally:
                     conn.close()
 
-        # 3. Envia o estado atualizado para todos os dashboards
         emit_state_update()
 
 @socketio.on('disconnect')
@@ -877,27 +799,19 @@ def handle_disconnect():
             break
     
     if disconnected_patient:
-        # Apenas remove o paciente da lista de online.
-        # Não tentamos mais adivinhar se a sessão deve parar.
-        # A parada de sessão agora é um evento explícito.
         del connected_clients[disconnected_patient]
         print(f"Paciente '{disconnected_patient}' removido da lista de online.")
 
-        # Se por acaso o paciente que desconectou era o que estava na sessão ativa,
-        # removemos ele da lista de ativos para a UI ficar correta.
         if disconnected_patient in active_sessions:
             session_id_to_stop = active_sessions[disconnected_patient].get('session_id')
-            if session_id_to_stop and session_id_to_stop in cache_sessoes:
-                process_final_batch(session_id_to_stop) #
-                del cache_sessoes[session_id_to_stop]
-                print(f"Cache para a sessão {session_id_to_stop} do paciente desconectado foi limpo.")
+            # <<< ALTERAÇÃO: A lógica de cache foi removida daqui, apenas a análise final é chamada. >>>
+            if session_id_to_stop:
+                process_final_batch(session_id_to_stop)
             del active_sessions[disconnected_patient]
             print(f"Sessão do paciente desconectado '{disconnected_patient}' removida da lista de ativas.")
 
-        # Atualiza o estado para todos os dashboards.
         emit_state_update()
         
-# <<< NOVO >>> Handler para quando o cliente (celular) informa que a sessão parou.
 @socketio.on('session_stopped_by_client')
 def handle_session_stopped(data):
     patient_name = data.get('patientId')
@@ -906,21 +820,16 @@ def handle_session_stopped(data):
 
     print(f"Recebido evento 'session_stopped_by_client' para o paciente: {patient_name}")
     
-    # A lógica é a mesma de quando o 'disconnect' ou o botão do site são acionados:
-    # Remove o paciente da lista de sessões ativas.
     if patient_name in active_sessions:
         session_id_to_stop = active_sessions[patient_name].get('session_id')
-        if session_id_to_stop and session_id_to_stop in cache_sessoes:
+        # <<< ALTERAÇÃO: A lógica de cache foi removida daqui, apenas a análise final é chamada. >>>
+        if session_id_to_stop:
             process_final_batch(session_id_to_stop)
-            del cache_sessoes[session_id_to_stop]
-            print(f"Cache para a sessão {session_id_to_stop} (parada pelo cliente) foi limpo.")
         del active_sessions[patient_name]
         
-        # Emite um evento para todos os dashboards atualizarem a sua lista.
         emit_state_update() 
         print(f"Sessão do paciente '{patient_name}' removida da lista de ativas via app.")
 
-# <<< NOVO >>> Handler para quando um cliente se reconecta e informa que já tem uma sessão ativa.
 @socketio.on('resume_active_session')
 def handle_resume_session(data):
     patient_name = data.get('patientName')
@@ -947,9 +856,7 @@ def handle_resume_session(data):
                 'patient_name': patient_name
             }
         
-            # 1. Avisa o cliente para recarregar a estrutura dos dropdowns
             socketio.emit('structure_changed')
-            # 2. Envia o estado completo e atualizado (pacientes online E ativos)
             emit_state_update()
 
             print(f"Sessão {session_id} do paciente '{patient_name}' restaurada na lista de ativas.")
@@ -980,3 +887,4 @@ if __name__ == '__main__':
     import eventlet
     # Usando o servidor WSGI do eventlet que é compatível com flask-socketio
     eventlet.wsgi.server(eventlet.listen((host, port)), app)
+

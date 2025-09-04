@@ -5,6 +5,8 @@
     <title>Dashboard de Controle e Análise</title>
     <script src="https://cdn.socket.io/4.7.5/socket.io.min.js"></script>
     <script src="https://cdn.jsdelivr.net/npm/chart.js"></script>
+    <!-- <<< ALTERAÇÃO: Adicionado o adaptador de data para o Chart.js >>> -->
+    <script src="https://cdn.jsdelivr.net/npm/chartjs-adapter-date-fns@3.0.0/dist/chartjs-adapter-date-fns.bundle.min.js"></script>
     <style>
         body { font-family: sans-serif; background-color: #f0f2f5; margin: 0; padding: 20px; display: flex; justify-content: center; }
         .container { display: flex; gap: 20px; width: 100%; max-width: 1400px; }
@@ -42,93 +44,23 @@
         .scale-btn { padding: 5px 10px; margin: 0 4px; border-radius: 4px; border: 1px solid #ccc; background-color: #f0f0f0; cursor: pointer; }
         .scale-btn.active { background-color: #007bff; color: white; border-color: #007bff; }
         
-        .history-patient-selector {
-            padding: 15px;
-            background-color: #f9f9f9;
-            border-radius: 8px;
-            text-align: center;
-            margin-bottom: 20px;
-        }
-        .history-patient-selector label {
-            font-weight: bold;
-            color: #555;
-            margin-right: 10px;
-        }
-        .history-patient-selector select {
-            font-size: 1.1em;
-            padding: 8px;
-            min-width: 300px;
-            border-radius: 5px;
-            border: 1px solid #ccc;
-        }
+        .history-patient-selector { padding: 15px; background-color: #f9f9f9; border-radius: 8px; text-align: center; margin-bottom: 20px; }
+        .history-patient-selector label { font-weight: bold; color: #555; margin-right: 10px; }
+        .history-patient-selector select { font-size: 1.1em; padding: 8px; min-width: 300px; border-radius: 5px; border: 1px solid #ccc; }
 
-        .heatmap-container {
-            padding: 15px;
-            background-color: #f8f9fa;
-            border: 1px solid #dee2e6;
-            border-radius: 8px;
-        }
-        .heatmap-header {
-            display: flex;
-            justify-content: space-between;
-            align-items: center;
-            margin-bottom: 15px;
-        }
-        .heatmap-header button {
-            background: none;
-            border: 1px solid #ccc;
-            border-radius: 5px;
-            cursor: pointer;
-            font-size: 1.2em;
-            padding: 5px 12px;
-        }
-         .heatmap-header button:hover {
-            background-color: #e9e9e9;
-         }
-        .heatmap-header h3 {
-            margin: 0;
-            font-size: 1.4em;
-        }
-        .heatmap-grid {
-            display: grid;
-            grid-template-columns: repeat(7, 1fr);
-            gap: 5px;
-        }
-        .heatmap-day, .heatmap-weekday {
-            padding: 10px 5px;
-            text-align: center;
-            border-radius: 4px;
-        }
-        .heatmap-weekday {
-            font-weight: bold;
-            background-color: #e9ecef;
-        }
-        .heatmap-day {
-            background-color: #e0e0e0;
-            color: #777;
-            min-height: 40px;
-            display: flex;
-            flex-direction: column;
-            justify-content: center;
-            align-items: center;
-            font-size: 0.9em;
-        }
-        .heatmap-day.has-data {
-            cursor: pointer;
-            color: black;
-            font-weight: bold;
-        }
-         .heatmap-day.has-data:hover {
-            outline: 2px solid #0056b3;
-         }
-        .heatmap-day.selected {
-             outline: 3px solid #000;
-             outline-offset: 2px;
-        }
-        .heatmap-day span {
-            font-size: 1.2em;
-            margin-bottom: 4px;
-        }
+        .heatmap-container { padding: 15px; background-color: #f8f9fa; border: 1px solid #dee2e6; border-radius: 8px; }
+        .heatmap-header { display: flex; justify-content: space-between; align-items: center; margin-bottom: 15px; }
+        .heatmap-header button { background: none; border: 1px solid #ccc; border-radius: 5px; cursor: pointer; font-size: 1.2em; padding: 5px 12px; }
+        .heatmap-header button:hover { background-color: #e9e9e9; }
+        .heatmap-header h3 { margin: 0; font-size: 1.4em; }
+        .heatmap-grid { display: grid; grid-template-columns: repeat(7, 1fr); gap: 5px; }
+        .heatmap-day, .heatmap-weekday { padding: 10px 5px; text-align: center; border-radius: 4px; }
+        .heatmap-weekday { font-weight: bold; background-color: #e9ecef; }
+        .heatmap-day { background-color: #e0e0e0; color: #777; min-height: 40px; display: flex; flex-direction: column; justify-content: center; align-items: center; font-size: 0.9em; }
+        .heatmap-day.has-data { cursor: pointer; color: black; font-weight: bold; }
+        .heatmap-day.has-data:hover { outline: 2px solid #0056b3; }
+        .heatmap-day.selected { outline: 3px solid #000; outline-offset: 2px; }
+        .heatmap-day span { font-size: 1.2em; margin-bottom: 4px; }
     </style>
 </head>
 <body>
@@ -262,32 +194,34 @@
         socket.on('session_update', (data) => {
             if (!currentSessionId || data.sessionId != currentSessionId) return;
             
-            // <<< USA A FUNÇÃO AUXILIAR >>>
             updateMetricsDisplay(data.metrics);
             
             if (data.charts && data.charts.labels && data.charts.labels.length > 0) {
-                magnitudeChart.data.labels.push(...data.charts.labels);
-                magnitudeChart.data.datasets[0].data.push(...data.charts.sinal_filtrado);
-                rawChart.data.labels.push(...data.charts.labels);
-                rawChart.data.datasets[0].data.push(...data.charts.x);
-                rawChart.data.datasets[1].data.push(...data.charts.y);
-                rawChart.data.datasets[2].data.push(...data.charts.z);
-                while (magnitudeChart.data.labels.length > MAX_CHART_POINTS) {
-                    magnitudeChart.data.labels.shift();
+                // <<< ALTERAÇÃO: Processa dados como objetos {x, y} para os gráficos de tempo real >>>
+                const newMagnitudeData = data.charts.labels.map((label, index) => ({ x: label, y: data.charts.sinal_filtrado[index] }));
+                const newRawDataX = data.charts.labels.map((label, index) => ({ x: label, y: data.charts.x[index] }));
+                const newRawDataY = data.charts.labels.map((label, index) => ({ x: label, y: data.charts.y[index] }));
+                const newRawDataZ = data.charts.labels.map((label, index) => ({ x: label, y: data.charts.z[index] }));
+
+                magnitudeChart.data.datasets[0].data.push(...newMagnitudeData);
+                rawChart.data.datasets[0].data.push(...newRawDataX);
+                rawChart.data.datasets[1].data.push(...newRawDataY);
+                rawChart.data.datasets[2].data.push(...newRawDataZ);
+                
+                while (magnitudeChart.data.datasets[0].data.length > MAX_CHART_POINTS) {
                     magnitudeChart.data.datasets[0].data.shift();
                 }
-                while (rawChart.data.labels.length > MAX_CHART_POINTS) {
-                    rawChart.data.labels.shift();
+                while (rawChart.data.datasets[0].data.length > MAX_CHART_POINTS) {
                     rawChart.data.datasets[0].data.shift();
                     rawChart.data.datasets[1].data.shift();
                     rawChart.data.datasets[2].data.shift();
                 }
+
                 magnitudeChart.update('none');
                 rawChart.update('none');
             }
         });
-
-        // <<< FUNÇÃO AUXILIAR PARA ATUALIZAR AS MÉTRICAS >>>
+        
         function updateMetricsDisplay(metrics) {
             if (!metrics) return;
             document.getElementById("rms-value").innerText = (metrics.intensidade_rms || 0).toFixed(4);
@@ -297,7 +231,8 @@
             document.getElementById("freq-y-value").innerText = (metrics.freq_pico_y || 0).toFixed(2) + " Hz";
             document.getElementById("freq-z-value").innerText = (metrics.freq_pico_z || 0).toFixed(2) + " Hz";
         }
-            function initializeBatteryChart() {
+        
+        function initializeBatteryChart() {
             const ctx = document.getElementById('batteryHistoryChart').getContext('2d');
             batteryHistoryChart = new Chart(ctx, {
                 type: 'line',
@@ -328,7 +263,6 @@
                 }
             });
         }
-
         
         function loadBatteryHistory(sessionId) {
             if (!sessionId) {
@@ -336,7 +270,6 @@
                 return;
             }
             
-            // Esconde as outras visualizações e mostra a da bateria
             document.getElementById('analysis-content').style.display = 'none';
             document.getElementById('history-view').style.display = 'none';
             document.querySelector('.main-content > .session-selector').style.display = 'none';
@@ -475,8 +408,11 @@
                     alert("Erro ao buscar dados do dia: " + data.error);
                     return;
                 }
-                historyIntervalChart.data.labels = data.interval_summary.map(item => item.label);
-                historyIntervalChart.data.datasets[0].data = data.interval_summary.map(item => item.avg_rms);
+                // <<< ALTERAÇÃO: Mapeia os dados para o formato {x, y} que o Chart.js entende para séries temporais >>>
+                historyIntervalChart.data.datasets[0].data = data.interval_summary.map(item => ({
+                    x: item.label, 
+                    y: item.avg_rms
+                }));
                 historyIntervalChart.update();
             }).catch(err => console.error("Falha na requisição de detalhes do dia:", err));
         }
@@ -511,7 +447,36 @@
 
         function initializeHistoryCharts() {
             const intervalCtx = document.getElementById('historyIntervalChart').getContext('2d');
-            historyIntervalChart = new Chart(intervalCtx, { type: 'bar', data: { labels: [], datasets: [{ label: 'Intensidade Média (RMS)', data: [], backgroundColor: 'rgba(54, 162, 235, 0.6)' }] }, options: { scales: { y: { beginAtZero: true } } } });
+            // <<< ALTERAÇÃO: Configura o gráfico de histórico para usar um eixo de tempo >>>
+            historyIntervalChart = new Chart(intervalCtx, {
+                type: 'bar',
+                data: {
+                    datasets: [{
+                        label: 'Intensidade Média (RMS)',
+                        data: [], // Os dados agora serão no formato {x, y}
+                        backgroundColor: 'rgba(54, 162, 235, 0.6)'
+                    }]
+                },
+                options: {
+                    scales: {
+                        y: { beginAtZero: true, title: { display: true, text: 'Intensidade (RMS)'} },
+                        x: {
+                            type: 'timeseries',
+                            time: {
+                                unit: 'minute',
+                                tooltipFormat: 'HH:mm', // Formato no tooltip
+                                displayFormats: {
+                                    minute: 'HH:mm' // Formato no eixo
+                                }
+                            },
+                            title: {
+                                display: true,
+                                text: 'Horário (Local)'
+                            }
+                        }
+                    }
+                }
+            });
         }
         
         function loadStructure(autoSelect = false, patientIdToSelect = null, sessionIdToSelect = null) {
@@ -533,9 +498,7 @@
         
         function loadInitialSessionData(sessionId) {
             document.getElementById('analysis-content').style.display = 'block';
-            magnitudeChart.data.labels = [];
             magnitudeChart.data.datasets[0].data = [];
-            rawChart.data.labels = [];
             rawChart.data.datasets[0].data = [];
             rawChart.data.datasets[1].data = [];
             rawChart.data.datasets[2].data = [];
@@ -547,17 +510,18 @@
                 updateMetricsDisplay(data.metrics);
                 
                 if (data.charts && data.charts.labels) {
+                    // <<< ALTERAÇÃO: Processa dados como objetos {x, y} para os gráficos de tempo real >>>
                     const labels = data.charts.labels.slice(-MAX_CHART_POINTS);
-                    const filteredData = data.charts.sinal_filtrado.slice(-MAX_CHART_POINTS);
-                    const xData = data.charts.x.slice(-MAX_CHART_POINTS);
-                    const yData = data.charts.y.slice(-MAX_CHART_POINTS);
-                    const zData = data.charts.z.slice(-MAX_CHART_POINTS);
-                    magnitudeChart.data.labels.push(...labels);
-                    magnitudeChart.data.datasets[0].data.push(...filteredData);
-                    rawChart.data.labels.push(...labels);
+                    const magnitudeData = data.charts.sinal_filtrado.slice(-MAX_CHART_POINTS).map((d, i) => ({ x: labels[i], y: d }));
+                    const xData = data.charts.x.slice(-MAX_CHART_POINTS).map((d, i) => ({ x: labels[i], y: d }));
+                    const yData = data.charts.y.slice(-MAX_CHART_POINTS).map((d, i) => ({ x: labels[i], y: d }));
+                    const zData = data.charts.z.slice(-MAX_CHART_POINTS).map((d, i) => ({ x: labels[i], y: d }));
+
+                    magnitudeChart.data.datasets[0].data.push(...magnitudeData);
                     rawChart.data.datasets[0].data.push(...xData);
                     rawChart.data.datasets[1].data.push(...yData);
                     rawChart.data.datasets[2].data.push(...zData);
+
                     magnitudeChart.update('none');
                     rawChart.update('none');
                 }
@@ -747,17 +711,64 @@
             });
         }
         function handleArchiveSelection(t){const e=t.target;"checkbox"===e.type&&(t=parseInt(e.dataset.id),e.checked?selectedForArchiving.add(t):selectedForArchiving.delete(t),document.getElementById("archive-selected-btn").disabled=0===selectedForArchiving.size)}
-        function executeArchive(){if(0!==selectedForArchiving.size){const t=Array.from(selectedForArchiving).map(t=>allPatientsData.find(e=>e.id===t)?.nome||`ID ${t}`).join(",\\n- ");confirm(`Tem certeza que deseja ARQUIVAR os seguintes pacientes?\\n\\n- ${t}\\n\\nEles sumirão das listas principais, mas poderão ser restaurados.`)&&(selectedForArchiving.forEach(t=>{fetch("/api/archive_patient",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({patientId:t})})}),toggleArchiveMode(!1))}}
+        function executeArchive(){if(0!==selectedForArchiving.size){const t=Array.from(selectedForArchiving).map(t=>allPatientsData.find(e=>e.id===t)?.nome||`ID ${t}`).join(",\n- ");confirm(`Tem certeza que deseja ARQUIVAR os seguintes pacientes?\n\n- ${t}\n\nEles sumirão das listas principais, mas poderão ser restaurados.`)&&(selectedForArchiving.forEach(t=>{fetch("/api/archive_patient",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({patientId:t})})}),toggleArchiveMode(!1))}}
         function showArchivedModal(){fetch("/api/archived_patients").then(t=>t.json()).then(t=>{const e=document.getElementById("archived-patient-list");e.innerHTML="",0===t.length?e.innerHTML="<li>Nenhum paciente arquivado.</li>":t.forEach(t=>{const n=document.createElement("li");n.innerHTML=`<span>${t.nome}</span> <button class="action-btn" onclick="restorePatient(${t.id})">Restaurar</button>`,e.appendChild(n)}),document.getElementById("archived-modal").style.display="block"})}
         function restorePatient(t){fetch("/api/restore_patient",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({patientId:t})}).then(()=>document.getElementById("archived-modal").style.display="none")}
         function populatePatientSelect(t){const e=document.getElementById("patient-select");e.innerHTML='<option value="">-- Selecione um Paciente --</option>',allPatientsData.forEach(t=>{const n=document.createElement("option");n.value=t.id,n.textContent=t.nome,e.appendChild(n)}),t&&allPatientsData.some(e=>e.id==t)&&(e.value=t)}
         function populateSessionSelect(sessions, keepSelectedId){const sessionSelect=document.getElementById("session-select");if(sessionSelect.innerHTML='<option value="">-- Selecione uma Sessão --</option>',sessions&&0<sessions.length){sessions.forEach(session=>{const option=document.createElement("option");option.value=session.id;try{option.textContent=`Sessão de ${new Date(session.timestamp).toLocaleString("pt-BR")}`}catch(e){option.textContent=session.id}sessionSelect.appendChild(option)}),sessionSelect.disabled=!1,keepSelectedId&&sessions.some(s=>s.id==keepSelectedId)&&(sessionSelect.value=keepSelectedId)}else sessionSelect.disabled=!0}
+        
         function initializeCharts() {
-            const t = document.getElementById("magnitudeChart").getContext("2d");
-            magnitudeChart = new Chart(t, { type: "line", data: { labels: [], datasets: [{ label: "Sinal de Tremor (Filtrado)", data: [], borderColor: "rgba(90, 90, 158, 1)", borderWidth: 1, pointRadius: 0 }] }, options: { animation: false, responsive: true, maintainAspectRatio: true, scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 8, callback: function(value) { const timestamp = this.getLabelForValue(value); return new Date(Number(timestamp)).toLocaleTimeString('pt-BR'); } } } } } });
-            const e = document.getElementById("rawChart").getContext("2d");
-            rawChart = new Chart(e, { type: "line", data: { labels: [], datasets: [{ label: "Eixo X", data: [], borderColor: "rgba(255, 99, 132, 1)", borderWidth: 1, pointRadius: 0 }, { label: "Eixo Y", data: [], borderColor: "rgba(75, 192, 192, 1)", borderWidth: 1, pointRadius: 0 }, { label: "Eixo Z", data: [], borderColor: "rgba(76, 175, 80, 1)", borderWidth: 1, pointRadius: 0 }] }, options: { animation: false, responsive: true, maintainAspectRatio: true, scales: { x: { ticks: { autoSkip: true, maxTicksLimit: 8, callback: function(value) { const timestamp = this.getLabelForValue(value); return new Date(Number(timestamp)).toLocaleTimeString('pt-BR'); } } } } } });
+            // <<< ALTERAÇÃO: Configura os gráficos de tempo real para usarem um eixo de tempo >>>
+            const commonTimeAxisOptions = {
+                type: 'timeseries',
+                time: {
+                    unit: 'second',
+                    tooltipFormat: 'HH:mm:ss',
+                    displayFormats: {
+                        second: 'HH:mm:ss'
+                    }
+                },
+                ticks: {
+                    source: 'data',
+                    autoSkip: true,
+                    maxRotation: 0,
+                    minRotation: 0,
+                    maxTicksLimit: 10,
+                }
+            };
+
+            const magnitudeCtx = document.getElementById("magnitudeChart").getContext("2d");
+            magnitudeChart = new Chart(magnitudeCtx, {
+                type: "line",
+                data: {
+                    datasets: [{ label: "Sinal de Tremor (Filtrado)", data: [], borderColor: "rgba(90, 90, 158, 1)", borderWidth: 1, pointRadius: 0 }]
+                },
+                options: {
+                    animation: false,
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    scales: { x: commonTimeAxisOptions, y: { title: { display: true, text: 'Amplitude' } } }
+                }
+            });
+
+            const rawCtx = document.getElementById("rawChart").getContext("2d");
+            rawChart = new Chart(rawCtx, {
+                type: "line",
+                data: {
+                    datasets: [
+                        { label: "Eixo X", data: [], borderColor: "rgba(255, 99, 132, 1)", borderWidth: 1, pointRadius: 0 },
+                        { label: "Eixo Y", data: [], borderColor: "rgba(75, 192, 192, 1)", borderWidth: 1, pointRadius: 0 },
+                        { label: "Eixo Z", data: [], borderColor: "rgba(76, 175, 80, 1)", borderWidth: 1, pointRadius: 0 }
+                    ]
+                },
+                options: {
+                    animation: false,
+                    responsive: true,
+                    maintainAspectRatio: true,
+                    scales: { x: commonTimeAxisOptions, y: { title: { display: true, text: 'Aceleração (m/s²)' } } }
+                }
+            });
         }
     </script>
 </body>
-</ht
+</html>
