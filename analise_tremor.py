@@ -83,8 +83,8 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 
 def process_and_push_update(session_id, novas_leituras):
     """
-    Processa um lote de dados priorizando a atualização em tempo real,
-    incluindo o sinal filtrado, antes da análise pesada.
+    Processa um lote de dados, calcula as métricas, envia a atualização completa
+    para o dashboard e salva a análise no banco de dados quando apropriado.
     """
     if not novas_leituras:
         return
@@ -92,122 +92,102 @@ def process_and_push_update(session_id, novas_leituras):
     with session_locks[session_id]:
         with app.app_context():
             try:
-                # Garante que o cache exista (lógica de recriação continua a mesma)
+                # Lógica de recriação de cache (sem alterações)
                 if session_id not in cache_sessoes:
-                    # ... (O bloco de recriação de cache que já temos. Cole o seu aqui se precisar)
                     print(f"Cache para sessão {session_id} não encontrado. Recriando do banco...")
                     conn_cache = get_db_connection()
                     if not conn_cache: return
                     try:
                         cursor_cache = conn_cache.cursor()
-                        cursor_cache.execute("SELECT timestamp_inicio FROM sessoes WHERE id = ?", session_id)
-                        sessao_info = cursor_cache.fetchone()
-                        if not sessao_info: return
                         sql_janela = f"SELECT TOP ({JANELA_DE_ANALISE}) timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
                         cursor_cache.execute(sql_janela, session_id)
                         rows = cursor_cache.fetchall()
                         rows.reverse()
                         cache_sessoes[session_id] = {
                             'data': deque([{'timestamp': row.timestamp_ms, 'x': row.x, 'y': row.y, 'z': row.z} for row in rows], maxlen=JANELA_DE_ANALISE),
-                            'total_samples': len(rows),
-                            'start_time_real': sessao_info.timestamp_inicio,
-                            'first_sensor_ts': rows[0].timestamp_ms if rows else None
+                            'total_samples': len(rows)
                         }
                         print(f"Cache para sessão {session_id} recriado com {len(rows)} amostras.")
                     finally:
                         conn_cache.close()
                 
                 cache = cache_sessoes[session_id]
-                
-                # Atualiza o cache com os novos dados
                 for leitura in novas_leituras:
                     cache['data'].append(leitura)
                 cache['total_samples'] += len(novas_leituras)
-                
-                if cache['first_sensor_ts'] is None and novas_leituras:
-                    cache['first_sensor_ts'] = novas_leituras[0]['timestamp']
 
-                # =================================================================
-                # ETAPA 1: ATUALIZAÇÃO RÁPIDA PARA O DASHBOARD (CORRIGIDA)
-                # =================================================================
-                try:
-                    if cache['first_sensor_ts'] is not None and len(cache['data']) > 0:
-                        
-                        # --- CÁLCULO DO SINAL FILTRADO (REINSERIDO AQUI) ---
-                        # Usamos o cache completo para dar contexto ao filtro
-                        df_rapido = pd.DataFrame(list(cache['data']))
-                        x_rapido = df_rapido['x'] - df_rapido['x'].mean()
-                        y_rapido = df_rapido['y'] - df_rapido['y'].mean()
-                        z_rapido = df_rapido['z'] - df_rapido['z'].mean()
-                        magnitude_rapida = np.sqrt(x_rapido**2 + y_rapido**2 + z_rapido**2)
-                        
-                        sinal_filtrado_completo = filtrar_sinal_passa_faixa(magnitude_rapida.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-                        # Pegamos apenas o trecho final do sinal filtrado, correspondente aos novos dados
-                        sinal_filtrado_para_grafico = sinal_filtrado_completo[-len(novas_leituras):].tolist() if sinal_filtrado_completo.any() else []
-
-                        # --- Conversão de timestamp ---
-                        start_time = cache['start_time_real']
-                        first_ts = cache['first_sensor_ts']
-                        labels_reais_ms = [ (start_time + timedelta(microseconds=(d['timestamp'] - first_ts) / 1000)).timestamp() * 1000 for d in novas_leituras ]
-                        
-                        df_novos_dados = pd.DataFrame(novas_leituras)
-                        payload_rapido = {
-                            "sessionId": session_id,
-                            "metrics": {"total_amostras": cache['total_samples']},
-                            "charts": {
-                                "labels": labels_reais_ms,
-                                "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
-                                "y": (df_novos_dados['y'] - df_novos_dados['y'].mean()).tolist(),
-                                "z": (df_novos_dados['z'] - df_novos_dados['z'].mean()).tolist(),
-                                "sinal_filtrado": sinal_filtrado_para_grafico # <<< CORRIGIDO
-                            }
-                        }
-                        socketio.emit('session_update', payload_rapido, room=f'session_room_{session_id}')
-                except Exception as e:
-                    print(f"AVISO: Falha ao emitir atualização rápida para o dashboard: {e}")
-
-
-                # =================================================================
-                # ETAPA 2: ANÁLISE PESADA E SALVAMENTO (BAIXA PRIORIDADE)
-                # =================================================================
-                if len(cache['data']) < 100:
+                # Condição de guarda: precisamos de um mínimo de dados para o filtro funcionar
+                if len(cache['data']) < 34: 
                     return
 
+                # --- ANÁLISE UNIFICADA ---
+                # Construímos o DataFrame a partir do cache completo para garantir precisão
                 df_analysis = pd.DataFrame(list(cache['data']))
                 
-                # ... (O resto da sua lógica de análise pesada e salvamento no banco continua aqui, sem alterações)
+                # Processamento do sinal
                 x_centered = df_analysis['x'] - df_analysis['x'].mean()
                 y_centered = df_analysis['y'] - df_analysis['y'].mean()
                 z_centered = df_analysis['z'] - df_analysis['z'].mean()
                 df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
-                sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
                 
+                sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+                sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+                sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+                sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+
+                # Cálculo das métricas
                 intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
                 freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
-                
-                sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
                 freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
-                sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
                 freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
-                sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
                 freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
+                
+                # --- PREPARAÇÃO DO PAYLOAD COMPLETO PARA O DASHBOARD ---
+                sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(novas_leituras):].tolist() if sinal_magnitude_filtrado.any() else []
+                df_novos_dados = pd.DataFrame(novas_leituras)
+                labels_reais_ms = [d['timestamp'] for d in novas_leituras]
+                
+                payload = {
+                    "sessionId": session_id,
+                    "metrics": {
+                        "total_amostras": cache['total_samples'],
+                        "intensidade_rms": intensidade_rms,
+                        "freq_dominante": freq_pico, # A chave para a freq. total no frontend
+                        "freq_pico_x": freq_pico_x,
+                        "freq_pico_y": freq_pico_y,
+                        "freq_pico_z": freq_pico_z
+                    },
+                    "charts": {
+                        "labels": labels_reais_ms,
+                        "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
+                        "y": (df_novos_dados['y'] - df_novos_dados['y'].mean()).tolist(),
+                        "z": (df_novos_dados['z'] - df_novos_dados['z'].mean()).tolist(),
+                        "sinal_filtrado": sinal_filtrado_para_grafico
+                    }
+                }
+                socketio.emit('session_update', payload, room=f'session_room_{session_id}')
 
-                conn_insert = get_db_connection()
-                if conn_insert:
-                    try:
-                        cursor_insert = conn_insert.cursor()
-                        ultimo_timestamp_sensor = df_analysis['timestamp'].iloc[-1]
-                        sql_insert_analise = """
-                            INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms)
-                            VALUES (?, GETDATE(), ?, ?, ?, ?, ?, ?);"""
-                        cursor_insert.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, int(ultimo_timestamp_sensor))
-                    finally:
-                        conn_insert.close()
-
+                # --- SALVAMENTO NO BANCO DE DADOS (QUANDO A CONDIÇÃO É ATINGIDA) ---
+                if len(cache['data']) >= 100:
+                    conn_insert = get_db_connection()
+                    if conn_insert:
+                        try:
+                            cursor_insert = conn_insert.cursor()
+                            ultimo_timestamp_sensor = int(df_analysis['timestamp'].iloc[-1])
+                            sql_insert_analise = """
+                                INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms)
+                                VALUES (?, GETDATE(), ?, ?, ?, ?, ?, ?);"""
+                            # <<< CORREÇÃO: Usando as variáveis calculadas em vez de zeros >>>
+                            cursor_insert.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, ultimo_timestamp_sensor)
+                        finally:
+                            conn_insert.close()
+                
             except Exception as e:
                 print(f"Erro em process_and_push_update: {e}")
                 import traceback
                 traceback.print_exc()
+
+
 
 def process_final_batch(session_id):
     """
@@ -293,6 +273,51 @@ def emit_state_update():
 def dashboard():
     # Passamos a variável para o template, embora não seja mais usada para polling
     return render_template('dashboard.html', tempo_requisicao_ms=TEMPO_REQUISICAO_MS)
+
+@app.route('/battery_data', methods=['POST'])
+def receber_dados_bateria():
+    """
+    Recebe um lote de leituras de bateria do celular e salva no banco de dados.
+    """
+    try:
+        payload = request.get_json()
+        if not payload or 'sessao_id' not in payload or 'data' not in payload:
+            return jsonify({"status": "erro", "message": "Payload inválido"}), 400
+
+        sessao_id = int(payload['sessao_id'])
+        dados_bateria = payload['data']
+        
+        if not dados_bateria:
+            return jsonify({"status": "sucesso", "message": "Nenhum dado de bateria para inserir"}), 200
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
+        
+        cursor = conn.cursor()
+        
+        # Prepara os parâmetros para inserção em lote
+        params = []
+        for leitura in dados_bateria:
+            # Converte o timestamp Unix (em milissegundos) para um objeto datetime
+            ts_unix = leitura.get('timestamp') / 1000
+            ts_datetime = datetime.fromtimestamp(ts_unix)
+            params.append((sessao_id, ts_datetime, leitura.get('batteryLevel')))
+
+        sql = "INSERT INTO leituras_bateria (sessao_id, timestamp_leitura, nivel_bateria) VALUES (?, ?, ?)"
+        cursor.executemany(sql, params)
+        
+        print(f"Sucesso: {len(dados_bateria)} leituras de bateria inseridas para a sessão {sessao_id}.")
+        return jsonify({"status": "sucesso"}), 201
+
+    except Exception as e:
+        import traceback
+        print(f"ERRO INESPERADO em /battery_data: {e}")
+        traceback.print_exc()
+        return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
 
 # <<< NOVA ROTA DE API PARA O HISTÓRICO DE BATERIA >>>
 @app.route('/api/battery_history')
@@ -406,153 +431,127 @@ def get_monthly_heatmap():
     finally:
         conn.close()
 
-
-import numpy as np # Garanta que numpy está importado no topo do seu arquivo
-
 @app.route('/api/historical_data')
 def get_historical_data():
-    print("\n--- INÍCIO DA REQUISIÇÃO /api/historical_data ---")
     patient_id = request.args.get('patient_id')
     end_date_str = request.args.get('end_date', datetime.utcnow().strftime('%Y-%m-%d'))
     start_date_str = request.args.get('start_date', (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d'))
     
-    print(f"[PARÂMETROS] patient_id: {patient_id}, start_date: {start_date_str}, end_date: {end_date_str}")
-
     try:
         interval_minutes = int(request.args.get('interval', '60'))
     except (ValueError, TypeError):
-        print("[ERRO] Falha ao converter 'interval' para inteiro.")
         return jsonify({"error": "Intervalo deve ser um número."}), 400
 
     if not patient_id:
-        print("[ERRO] patient_id não foi fornecido.")
         return jsonify({"error": "ID do paciente não fornecido"}), 400
 
     conn = get_db_connection()
     if not conn:
-        print("[ERRO] Falha ao conectar no banco de dados.")
         return jsonify({"error": "Falha na conexão com o banco"}), 500
 
     response_data = {"daily_summary": [], "interval_summary": []}
     
     try:
-        # Adicionando um dia ao end_date para a lógica do '<' funcionar corretamente
-        end_date_obj = datetime.strptime(end_date_str, '%Y-%m-%d').date() + timedelta(days=1)
-        end_date_for_query = end_date_obj.strftime('%Y-%m-%d')
+        # --- CORREÇÃO PRINCIPAL: usar MILISSEGUNDOS ---
         
+        # 1. Converte as datas de string para objetos datetime
+        start_date_obj = datetime.strptime(start_date_str, '%Y-%m-%d')
+        end_date_obj = datetime.strptime(end_date_str, '%Y-%m-%d') + timedelta(days=1)  # O final é exclusivo
+
+        # 2. Converte para timestamps Unix em MILISSEGUNDOS
+        start_ts_ms = int(start_date_obj.timestamp() * 1000)
+        end_ts_ms = int(end_date_obj.timestamp() * 1000)
+
+        # 3. A query SQL agora compara apenas números (BIGINT), o que é seguro e rápido
         sql_fetch_all = """
             SELECT 
-                s.id as sessao_id, s.timestamp_inicio, aj.timestamp_sensor_ms,
-                aj.intensidade_rms, aj.freq_pico
-            FROM sessoes s JOIN analises_janela aj ON s.id = aj.sessao_id
+                s.id as sessao_id,
+                aj.timestamp_sensor_ms,
+                aj.intensidade_rms,
+                aj.freq_pico
+            FROM sessoes s 
+            JOIN analises_janela aj ON s.id = aj.sessao_id
             WHERE 
                 s.paciente_id = ? AND
-                CAST(aj.timestamp_janela AS DATE) >= ? AND 
-                CAST(aj.timestamp_janela AS DATE) <= ? AND
+                aj.timestamp_sensor_ms >= ? AND
+                aj.timestamp_sensor_ms < ? AND
                 aj.timestamp_sensor_ms IS NOT NULL
-            ORDER BY s.id, aj.timestamp_sensor_ms ASC;
+            ORDER BY aj.timestamp_sensor_ms ASC;
         """
         
         cursor = conn.cursor()
-        # Note que agora passamos start_date_str e end_date_str diretamente
-        cursor.execute(sql_fetch_all, int(patient_id), start_date_str, end_date_str)
+        # 4. Passa os timestamps em ms
+        cursor.execute(sql_fetch_all, int(patient_id), start_ts_ms, end_ts_ms)
         all_rows = cursor.fetchall()
 
-        print(f"Linhas retornadas do banco (versão final da query): {len(all_rows)}")
-
-
         if not all_rows:
-            print("[FIM] Nenhuma linha no DB. Retornando resposta vazia.")
             return jsonify(response_data)
 
         df = pd.DataFrame.from_records(all_rows, columns=[desc[0] for desc in cursor.description])
-        print("[PANDAS] 2. DataFrame criado com sucesso. Amostra:")
-        print(df.head())
-        print("\n[PANDAS] 3. Tipos de dados (dtypes) do DataFrame ANTES da conversão:")
-        print(df.dtypes)
-
-        # Forçar a conversão de timestamp_sensor_ms para um tipo numérico de 64 bits
-        df['timestamp_sensor_ms'] = pd.to_numeric(df['timestamp_sensor_ms'], errors='coerce').astype(np.int64)
-        df.dropna(subset=['timestamp_sensor_ms'], inplace=True)
         
-        print("\n[PANDAS] 4. Tipos de dados (dtypes) DEPOIS da conversão:")
-        print(df.dtypes)
+        # Converte os timestamps de MILISSEGUNDOS para objetos datetime do Pandas
+        df['real_timestamp'] = pd.to_datetime(df['timestamp_sensor_ms'], unit='ms')
 
-        def calculate_real_timestamp(group):
-            session_start_time = group['timestamp_inicio'].iloc[0]
-            first_sensor_timestamp = group['timestamp_sensor_ms'].iloc[0]
-            group['real_timestamp'] = group['timestamp_sensor_ms'].apply(
-                lambda ts: session_start_time + timedelta(microseconds=(ts - first_sensor_timestamp) / 1000)
-            )
-            return group
-
-        df = df.groupby('sessao_id', group_keys=False).apply(calculate_real_timestamp)
-        print("\n[PANDAS] 5. DataFrame após cálculo de 'real_timestamp'. Amostra:")
-        print(df[['sessao_id', 'real_timestamp']].head())
-        
-        print(f"\n[PANDAS] 6. Range de datas calculado: MIN={df['real_timestamp'].min()}, MAX={df['real_timestamp'].max()}")
-
-        # Resumo Diário
-        daily_summary_df = df.set_index('real_timestamp').groupby(pd.Grouper(freq='D')).agg(
-            media_rms=('intensidade_rms', 'mean'),
-            max_rms=('intensidade_rms', 'max'),
-            media_freq=('freq_pico', 'mean')
-        ).dropna().reset_index()
-
-        print(f"[AGREGAÇÃO] 7. Linhas no resumo diário (daily_summary_df): {len(daily_summary_df)}")
-        # ... (resto do código igual)
+        # --- Agregação diária ---
+        daily_summary_df = (
+            df.set_index('real_timestamp')
+              .groupby(pd.Grouper(freq='D'))
+              .agg(
+                  media_rms=('intensidade_rms', 'mean'),
+                  max_rms=('intensidade_rms', 'max'),
+                  media_freq=('freq_pico', 'mean')
+              )
+              .dropna()
+              .reset_index()
+        )
 
         response_data["daily_summary"] = [
-            {"date": row.real_timestamp.strftime('%Y-%m-%d'), "avg_rms": row.media_rms, "max_rms": row.max_rms, "avg_freq": row.media_freq} 
-            for index, row in daily_summary_df.iterrows()
+            {
+                "date": row.real_timestamp.strftime('%Y-%m-%d'),
+                "avg_rms": row.media_rms,
+                "max_rms": row.max_rms,
+                "avg_freq": row.media_freq
+            } 
+            for _, row in daily_summary_df.iterrows()
         ]
-
+        
+        # --- Agregação por intervalos no último dia ---
         if not df.empty:
             last_day_with_data = df['real_timestamp'].max().date()
             df_last_day = df[df['real_timestamp'].dt.date == last_day_with_data]
-
             if not df_last_day.empty:
-                interval_summary_df = df_last_day.set_index('real_timestamp').groupby(pd.Grouper(freq=f'{interval_minutes}min')).agg(
-                    media_rms=('intensidade_rms', 'mean')
-                ).reset_index()
+                interval_summary_df = (
+                    df_last_day.set_index('real_timestamp')
+                               .groupby(pd.Grouper(freq=f'{interval_minutes}min'))
+                               .agg(media_rms=('intensidade_rms', 'mean'))
+                               .reset_index()
+                )
 
-                full_day_intervals = pd.date_range(start=last_day_with_data, end=last_day_with_data + timedelta(days=1), freq=f'{interval_minutes}min', inclusive='left')
-                interval_map = pd.Series(interval_summary_df.media_rms.values, index=interval_summary_df.real_timestamp)
-                final_series = interval_map.reindex(full_day_intervals, fill_value=None) 
+                full_day_intervals = pd.date_range(
+                    start=last_day_with_data, 
+                    end=last_day_with_data + timedelta(days=1),
+                    freq=f'{interval_minutes}min',
+                    inclusive='left'
+                )
+
+                interval_map = pd.Series(interval_summary_df.media_rms.values,
+                                         index=interval_summary_df.real_timestamp)
+                final_series = interval_map.reindex(full_day_intervals, fill_value=None)
 
                 response_data["interval_summary"] = [
                     {"label": ts.strftime('%H:%M'), "avg_rms": value if pd.notna(value) else 0}
                     for ts, value in final_series.items()
                 ]
-        
-        print(f"[FIM] Requisição processada com sucesso. Enviando {len(response_data['daily_summary'])} resumos diários e {len(response_data['interval_summary'])} resumos de intervalo.")
+
         return jsonify(response_data)
 
     except Exception as e:
         import traceback
-        print(f"ERRO CRÍTICO em /api/historical_data: {e}")
         traceback.print_exc()
-        return jsonify({"error": "Erro interno no servidor"}), 500
+        return jsonify({"error": f"Erro interno no servidor: {str(e)}"}), 500
     finally:
         if conn:
             conn.close()
-
-@app.route('/api/archive_patient', methods=['POST'])
-def archive_patient():
-    data = request.get_json()
-    patient_id = data.get('patientId')
-    if not patient_id: return jsonify({"status": "erro", "message": "ID não fornecido"}), 400
-    conn = get_db_connection()
-    if not conn: return jsonify({"status": "erro", "message": "Falha na conexão"}), 500
-    cursor = conn.cursor()
-    sql = "UPDATE pacientes SET esta_ativo = 0 WHERE id = ?"
-    try:
-        cursor.execute(sql, patient_id)
-        print(f"Paciente com ID {patient_id} arquivado com sucesso.")
-        socketio.emit('structure_changed')
-        return jsonify({"status": "sucesso", "message": f"Paciente {patient_id} arquivado."})
-    except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
-    finally: conn.close()
 
 # <<< NOVO >>> Endpoint para obter a lista de sessões ativas
 @app.route('/api/active_sessions')
@@ -639,6 +638,7 @@ def receber_dados():
 # =================================================================================
 # <<< SUBSTITUIÇÃO: Antigo endpoint de polling agora serve apenas dados iniciais >>>
 # =================================================================================
+
 @app.route('/api/initial_session_data')
 def initial_session_data():
     session_id = request.args.get('id')
@@ -649,37 +649,25 @@ def initial_session_data():
     cursor = conn.cursor()
 
     try:
-        # Busca a hora de início da sessão e os dados de uma vez
-        cursor.execute("SELECT timestamp_inicio FROM sessoes WHERE id = ?", int(session_id))
-        session_info = cursor.fetchone()
-        if not session_info: return jsonify({"error": "Sessão não encontrada"}), 404
-        start_time_real = session_info.timestamp_inicio
-
+        # <<< SIMPLIFICAÇÃO: Não precisamos mais do start_time_real nesta rota >>>
         sql_completo = "SELECT timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms ASC"
         cursor.execute(sql_completo, int(session_id))
         rows = cursor.fetchall()
         
         if not rows:
+            cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", int(session_id))
+            total_amostras = cursor.fetchone()[0]
             return jsonify({
-                "metrics": {"total_amostras": 0, "freq_dominante": 0, "intensidade_rms": 0}, 
+                "metrics": {"total_amostras": total_amostras, "freq_dominante": 0, "intensidade_rms": 0}, 
                 "charts": {"labels": [], "x": [], "y": [], "z": [], "sinal_filtrado": []}
             })
 
         df = pd.DataFrame.from_records(rows, columns=[desc[0] for desc in cursor.description])
         total_amostras = len(df)
         
-        # <<< LÓGICA DE CONVERSÃO DE TIMESTAMP APLICADA AQUI TAMBÉM >>>
-        first_sensor_ts = df["timestamp_ms"].iloc[0]
+        # <<< SIMPLIFICAÇÃO: A conversão complexa de tempo foi removida >>>
+        labels_reais_ms = df["timestamp_ms"].tolist()
         
-        def to_unix_ms(ts):
-            delta_nanos = ts - first_sensor_ts
-            delta = timedelta(microseconds=delta_nanos / 1000)
-            real_time = start_time_real + delta
-            return real_time.timestamp() * 1000
-            
-        labels_reais_ms = df["timestamp_ms"].apply(to_unix_ms).tolist()
-        
-        # O resto da análise...
         x_centered = df['x'] - df['x'].mean()
         y_centered = df['y'] - df['y'].mean()
         z_centered = df['z'] - df['z'].mean()
@@ -691,7 +679,7 @@ def initial_session_data():
         return jsonify({
             "metrics": {"freq_dominante": freq_pico, "intensidade_rms": intensidade_rms, "total_amostras": total_amostras},
             "charts": {
-                "labels": labels_reais_ms, # <<< USA LABELS CORRIGIDOS
+                "labels": labels_reais_ms,
                 "x": x_centered.tolist(),  
                 "y": y_centered.tolist(),
                 "z": z_centered.tolist(),
@@ -704,7 +692,7 @@ def initial_session_data():
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
-
+        
 @app.route('/api/start_session', methods=['POST'])
 def start_session():
     data = request.get_json()
@@ -714,13 +702,10 @@ def start_session():
     patient_name_for_dict = patient_name_raw
     patient_name_for_db = patient_name_raw.replace(" ", "_").lower()
 
-    # <<< CORREÇÃO PRINCIPAL AQUI >>>
-    # Pega o objeto de dados do cliente, não apenas o sid
     client_data = connected_clients.get(patient_name_for_dict)
     if not client_data: 
         return jsonify({"status": "erro", "message": "Paciente não conectado via WebSocket."}), 404
     
-    # Extrai o sid de dentro do objeto
     sid = client_data.get('sid')
     if not sid:
         return jsonify({"status": "erro", "message": "SID do paciente não encontrado."}), 500
@@ -734,7 +719,6 @@ def start_session():
         paciente = cursor.fetchone()
         if paciente:
             paciente_id = paciente.id
-            cursor.execute("UPDATE pacientes SET esta_ativo = 1 WHERE id = ?", paciente_id)
         else:
             cursor.execute("INSERT INTO pacientes (nome) OUTPUT INSERTED.id VALUES (?)", patient_name_for_db)
             paciente_id = cursor.fetchone().id
@@ -742,17 +726,10 @@ def start_session():
         cursor.execute("INSERT INTO sessoes (paciente_id, timestamp_inicio) OUTPUT INSERTED.id VALUES (?, GETDATE())", paciente_id)
         nova_sessao_id = cursor.fetchone().id
     
-        # Busca o timestamp_inicio que o banco acabou de gerar
-        cursor.execute("SELECT timestamp_inicio FROM sessoes WHERE id = ?", nova_sessao_id)
-        sessao_info = cursor.fetchone()
-        timestamp_inicio_real = sessao_info.timestamp_inicio
-
-        # <<< MUDANÇA AQUI: Guardamos o início real e preparamos para o primeiro timestamp >>>
+        # <<< CORREÇÃO: Cache simplificado. Não precisa mais de referências de tempo. >>>
         cache_sessoes[nova_sessao_id] = {
             'data': deque(maxlen=JANELA_DE_ANALISE),
-            'total_samples': 0,
-            'start_time_real': timestamp_inicio_real, # A hora de início absoluta
-            'first_sensor_ts': None  # Armazenaremos o primeiro timestamp do sensor aqui
+            'total_samples': 0
         }
 
         active_sessions[patient_name_for_dict] = {
@@ -761,9 +738,7 @@ def start_session():
             'patient_name': patient_name_for_dict
         }
         
-        # Agora estamos usando a variável 'sid' correta (uma string)
         socketio.emit('start_monitoring', {'sessao_id': nova_sessao_id}, room=sid)
-        
         socketio.emit('session_started', {'patientId': paciente_id, 'sessionId': nova_sessao_id}, room='dashboards')
         emit_state_update()
 
@@ -771,7 +746,6 @@ def start_session():
         return jsonify({"status": "sucesso", "message": "Sessão iniciada e registrada no banco."})
     except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
     finally: conn.close()
-
 
 @app.route('/api/stop_session', methods=['POST'])
 def stop_session():

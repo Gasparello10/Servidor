@@ -1,0 +1,44 @@
+@app.route('/battery_data', methods=['POST'])
+def receber_dados_bateria():
+    """
+    Recebe um lote de leituras de bateria do celular e salva no banco de dados.
+    """
+    try:
+        payload = request.get_json()
+        if not payload or 'sessao_id' not in payload or 'data' not in payload:
+            return jsonify({"status": "erro", "message": "Payload inválido"}), 400
+
+        sessao_id = int(payload['sessao_id'])
+        dados_bateria = payload['data']
+        
+        if not dados_bateria:
+            return jsonify({"status": "sucesso", "message": "Nenhum dado de bateria para inserir"}), 200
+
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
+        
+        cursor = conn.cursor()
+        
+        # Prepara os parâmetros para inserção em lote
+        params = []
+        for leitura in dados_bateria:
+            # Converte o timestamp Unix (em milissegundos) para um objeto datetime
+            ts_unix = leitura.get('timestamp') / 1000
+            ts_datetime = datetime.fromtimestamp(ts_unix)
+            params.append((sessao_id, ts_datetime, leitura.get('batteryLevel')))
+
+        sql = "INSERT INTO leituras_bateria (sessao_id, timestamp_leitura, nivel_bateria) VALUES (?, ?, ?)"
+        cursor.executemany(sql, params)
+        
+        print(f"Sucesso: {len(dados_bateria)} leituras de bateria inseridas para a sessão {sessao_id}.")
+        return jsonify({"status": "sucesso"}), 201
+
+    except Exception as e:
+        import traceback
+        print(f"ERRO INESPERADO em /battery_data: {e}")
+        traceback.print_exc()
+        return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
+    finally:
+        if 'conn' in locals() and conn:
+            conn.close()
