@@ -15,6 +15,7 @@ from datetime import datetime, timedelta
 import math 
 from collections import deque
 from threading import Lock
+import pytz
 
 # ==========================
 # CONFIGURAÇÕES GLOBAIS
@@ -246,6 +247,8 @@ def emit_state_update():
 def dashboard():
     return render_template('dashboard.html', tempo_requisicao_ms=TEMPO_REQUISICAO_MS)
 
+
+
 @app.route('/battery_data', methods=['POST'])
 def receber_dados_bateria():
     """
@@ -403,122 +406,81 @@ def get_monthly_heatmap():
 @app.route('/api/historical_data')
 def get_historical_data():
     patient_id = request.args.get('patient_id')
-    end_date_str = request.args.get('end_date', datetime.utcnow().strftime('%Y-%m-%d'))
-    start_date_str = request.args.get('start_date', (datetime.utcnow() - timedelta(days=30)).strftime('%Y-%m-%d'))
+    # <<< ALTERAÇÃO: A data do request é 'start_date', não 'end_date' para um único dia >>>
+    date_str = request.args.get('start_date') # O dashboard envia 'start_date'
+    interval_minutes_str = request.args.get('interval', '60')
+
+    if not patient_id or not date_str:
+        return jsonify({"error": "Parâmetros 'patient_id' e 'start_date' são obrigatórios."}), 400
     
     try:
-        interval_minutes = int(request.args.get('interval', '60'))
-    except (ValueError, TypeError):
-        return jsonify({"error": "Intervalo deve ser um número."}), 400
+        interval_minutes = int(interval_minutes_str)
 
-    if not patient_id:
-        return jsonify({"error": "ID do paciente não fornecido"}), 400
-
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({"error": "Falha na conexão com o banco"}), 500
-
-    response_data = {"daily_summary": [], "interval_summary": []}
-    
-    try:
-        # 1. Converte as datas de string para objetos datetime
-        start_date_obj = datetime.strptime(start_date_str, '%Y-%m-%d')
-        end_date_obj = datetime.strptime(end_date_str, '%Y-%m-%d') + timedelta(days=1)  # O final é exclusivo
-
-        # 2. Converte para timestamps Unix em MILISSEGUNDOS
-        start_ts_ms = int(start_date_obj.timestamp() * 1000)
-        end_ts_ms = int(end_date_obj.timestamp() * 1000)
-
-        # 3. A query SQL agora compara apenas números (BIGINT), o que é seguro e rápido
-        sql_fetch_all = """
-            SELECT 
-                s.id as sessao_id,
-                aj.timestamp_sensor_ms,
-                aj.intensidade_rms,
-                aj.freq_pico
-            FROM sessoes s 
-            JOIN analises_janela aj ON s.id = aj.sessao_id
-            WHERE 
-                s.paciente_id = ? AND
-                aj.timestamp_sensor_ms >= ? AND
-                aj.timestamp_sensor_ms < ? AND
-                aj.timestamp_sensor_ms IS NOT NULL
-            ORDER BY aj.timestamp_sensor_ms ASC;
-        """
+        # --- LÓGICA DE FUSO HORÁRIO CORRIGIDA ---
+        local_tz = pytz.timezone('America/Sao_Paulo')
         
-        cursor = conn.cursor()
-        # 4. Passa os timestamps em ms
-        cursor.execute(sql_fetch_all, int(patient_id), start_ts_ms, end_ts_ms)
-        all_rows = cursor.fetchall()
-
-        if not all_rows:
-            return jsonify(response_data)
-
-        df = pd.DataFrame.from_records(all_rows, columns=[desc[0] for desc in cursor.description])
+        # Interpreta a data de entrada como o início do dia no fuso horário local
+        start_date_local = local_tz.localize(datetime.strptime(date_str, '%Y-%m-%d'))
+        end_date_local = start_date_local + timedelta(days=1)
         
-        # Converte os timestamps de MILISSEGUNDOS para objetos datetime do Pandas
-        df['real_timestamp'] = pd.to_datetime(df['timestamp_sensor_ms'], unit='ms')
+        # Converte para timestamps em milissegundos para a consulta
+        start_ts_ms = int(start_date_local.timestamp() * 1000)
+        end_ts_ms = int(end_date_local.timestamp() * 1000)
+        # --- FIM DA LÓGICA DE FUSO HORÁRIO ---
 
-        # --- Agregação diária ---
-        daily_summary_df = (
-            df.set_index('real_timestamp')
-              .groupby(pd.Grouper(freq='D'))
-              .agg(
-                  media_rms=('intensidade_rms', 'mean'),
-                  max_rms=('intensidade_rms', 'max'),
-                  media_freq=('freq_pico', 'mean')
-              )
-              .dropna()
-              .reset_index()
-        )
+        conn = get_db_connection()
+        if not conn:
+            return jsonify({"error": "Falha na conexão com o banco"}), 500
 
-        response_data["daily_summary"] = [
-            {
-                "date": row.real_timestamp.strftime('%Y-%m-%d'),
-                "avg_rms": row.media_rms,
-                "max_rms": row.max_rms,
-                "avg_freq": row.media_freq
-            } 
-            for _, row in daily_summary_df.iterrows()
-        ]
-        
-        # --- Agregação por intervalos no último dia ---
-        if not df.empty:
-            last_day_with_data = df['real_timestamp'].max().date()
-            df_last_day = df[df['real_timestamp'].dt.date == last_day_with_data]
-            if not df_last_day.empty:
-                interval_summary_df = (
-                    df_last_day.set_index('real_timestamp')
-                               .groupby(pd.Grouper(freq=f'{interval_minutes}min'))
-                               .agg(media_rms=('intensidade_rms', 'mean'))
-                               .reset_index()
-                )
+        try:
+            sql = """
+                SELECT aj.timestamp_sensor_ms, aj.intensidade_rms
+                FROM analises_janela aj
+                JOIN sessoes s ON aj.sessao_id = s.id
+                WHERE s.paciente_id = ? 
+                  AND aj.timestamp_sensor_ms >= ? 
+                  AND aj.timestamp_sensor_ms < ?
+                  AND aj.intensidade_rms IS NOT NULL
+                ORDER BY aj.timestamp_sensor_ms;
+            """
+            cursor = conn.cursor()
+            cursor.execute(sql, int(patient_id), start_ts_ms, end_ts_ms)
+            
+            data = cursor.fetchall()
+            if not data:
+                # Retorna uma lista vazia se não houver dados para o dia
+                return jsonify({"interval_summary": []})
 
-                full_day_intervals = pd.date_range(
-                    start=last_day_with_data, 
-                    end=last_day_with_data + timedelta(days=1),
-                    freq=f'{interval_minutes}min',
-                    inclusive='left'
-                )
+            df = pd.DataFrame.from_records(data, columns=[desc[0] for desc in cursor.description])
+            
+            # Converte a coluna de timestamp para datetime com o fuso local correto
+            df['timestamp'] = pd.to_datetime(df['timestamp_sensor_ms'], unit='ms', utc=True).dt.tz_convert(local_tz)
+            
+            df = df.set_index('timestamp')
 
-                interval_map = pd.Series(interval_summary_df.media_rms.values,
-                                         index=interval_summary_df.real_timestamp)
-                final_series = interval_map.reindex(full_day_intervals, fill_value=None)
+            # Agrupa os dados pelo intervalo de minutos e calcula a média do RMS
+            interval_summary_df = df.resample(f'{interval_minutes}min').mean()
+            
+            # Formata a saída para o formato que o gráfico espera
+            interval_summary = [
+                {
+                    "label": index.isoformat(), # Envia no formato ISO, que o Chart.js entende
+                    "avg_rms": row['intensidade_rms'] if pd.notna(row['intensidade_rms']) else 0
+                }
+                for index, row in interval_summary_df.iterrows()
+            ]
 
-                response_data["interval_summary"] = [
-                    {"label": int(ts.timestamp() * 1000), "avg_rms": value if pd.notna(value) else 0}
-                    for ts, value in final_series.items()
-                ]
+        finally:
+            conn.close()
 
-        return jsonify(response_data)
+        # A resposta deve ter a chave 'interval_summary' que o dashboard espera
+        return jsonify({"interval_summary": interval_summary})
 
     except Exception as e:
         import traceback
         traceback.print_exc()
         return jsonify({"error": f"Erro interno no servidor: {str(e)}"}), 500
-    finally:
-        if conn:
-            conn.close()
+
 
 
 
