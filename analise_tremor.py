@@ -30,6 +30,7 @@ NPERSEG_WELCH = 512
 # <<< ALTERAÇÃO: O cache global foi removido. Era a fonte do problema de contaminação de dados. >>>
 # cache_sessoes = {}
 session_locks = defaultdict(Lock)
+last_timestamp_sent = {}
 
 # --- Configurações do servidor ---
 HOST = '0.0.0.0'
@@ -39,7 +40,8 @@ TEMPO_REQUISICAO_MS = 500 # Intervalo entre atualizações no dashboard (ms) - A
 # --- Configurações de banco de dados ---
 CONN_STR = (
     r'DRIVER={ODBC Driver 17 for SQL Server};'
-    r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
+    #r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
+    r'SERVER=localhost;'
     r'DATABASE=AnaliseTremorDB_Teste;'
     r'Trusted_Connection=yes;'
 )
@@ -83,24 +85,21 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
     return freqs[pico_idx]
 
 
-# =================================================================================
-# <<< ALTERAÇÃO: Função de análise reescrita para ser "Stateless" (sem cache) >>>
-# =================================================================================
 def process_and_push_update(session_id, novas_leituras):
     """
-    Processa um lote de dados de forma "stateless", buscando o contexto histórico
-    necessário do banco de dados para cada execução, evitando contaminação de cache.
+    Processa um lote de dados, salva a análise completa no banco, mas envia
+    apenas os dados cronologicamente novos para a visualização em tempo real.
     """
     if not novas_leituras:
         return
 
-    # Garante que o lote atual está em ordem para pegar o timestamp inicial correto
+    # Garante que o lote atual está em ordem cronológica
     novas_leituras.sort(key=lambda x: x['timestamp'])
 
     with session_locks[session_id]:
         with app.app_context():
             try:
-                # --- 1. Busca o contexto histórico do banco de dados ---
+                # --- 1. Busca o contexto histórico e constrói a janela de análise ---
                 min_ts_in_chunk = novas_leituras[0]['timestamp']
                 num_leituras_necessarias_db = JANELA_DE_ANALISE - len(novas_leituras)
                 
@@ -110,7 +109,6 @@ def process_and_push_update(session_id, novas_leituras):
                     if not conn_context: return
                     try:
                         cursor_context = conn_context.cursor()
-                        # Busca as leituras imediatamente anteriores a este lote
                         sql_context = f"""
                             SELECT TOP ({num_leituras_necessarias_db}) timestamp_ms, x, y, z 
                             FROM leituras 
@@ -119,18 +117,17 @@ def process_and_push_update(session_id, novas_leituras):
                         """
                         cursor_context.execute(sql_context, session_id, min_ts_in_chunk)
                         rows = cursor_context.fetchall()
-                        rows.reverse()  # Reordena do mais antigo para o mais novo
+                        rows.reverse()
                         leituras_contexto_db = [{'timestamp': r.timestamp_ms, 'x': r.x, 'y': r.y, 'z': r.z} for r in rows]
                     finally:
                         conn_context.close()
 
-                # --- 2. Constrói uma janela de análise limpa e cronológica ---
                 janela_completa = leituras_contexto_db + novas_leituras
                 
                 if len(janela_completa) < 34:
                     return
 
-                # --- 3. ANÁLISE UNIFICADA ---
+                # --- 2. ANÁLISE UNIFICADA (Usa a janela completa) ---
                 df_analysis = pd.DataFrame(janela_completa)
                 
                 x_centered = df_analysis['x'] - df_analysis['x'].mean()
@@ -148,60 +145,80 @@ def process_and_push_update(session_id, novas_leituras):
                 freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
                 freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
                 freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
-                
-                # --- 4. PREPARAÇÃO DO PAYLOAD PARA O DASHBOARD ---
-                total_samples = 0
-                conn_count = get_db_connection()
-                if conn_count:
-                    try:
-                        cursor_count = conn_count.cursor()
-                        cursor_count.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", session_id)
-                        total_samples_tuple = cursor_count.fetchone()
-                        if total_samples_tuple:
-                            total_samples = total_samples_tuple[0]
-                    finally:
-                        conn_count.close()
 
-                sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(novas_leituras):].tolist() if sinal_magnitude_filtrado.any() else []
-                df_novos_dados = pd.DataFrame(novas_leituras)
-                labels_reais_ms = [d['timestamp'] for d in novas_leituras]
-                
-                payload = {
-                    "sessionId": session_id,
-                    "metrics": {
-                        "total_amostras": total_samples,
-                        "intensidade_rms": intensidade_rms,
-                        "freq_dominante": freq_pico,
-                        "freq_pico_x": freq_pico_x,
-                        "freq_pico_y": freq_pico_y,
-                        "freq_pico_z": freq_pico_z
-                    },
-                    "charts": {
-                        "labels": labels_reais_ms,
-                        "x": (df_novos_dados['x'] - df_novos_dados['x'].mean()).tolist(),
-                        "y": (df_novos_dados['y'] - df_novos_dados['y'].mean()).tolist(),
-                        "z": (df_novos_dados['z'] - df_novos_dados['z'].mean()).tolist(),
-                        "sinal_filtrado": sinal_filtrado_para_grafico
+                # --- 3. FILTRAGEM APENAS PARA VISUALIZAÇÃO EM TEMPO REAL ---
+                ultimo_ts_enviado = last_timestamp_sent.get(session_id, 0)
+                leituras_para_grafico = [leitura for leitura in novas_leituras if leitura['timestamp'] > ultimo_ts_enviado]
+
+                if leituras_para_grafico:
+                    # --- 4. PREPARAÇÃO DO PAYLOAD PARA O DASHBOARD ---
+                    total_samples = 0
+                    conn_count = get_db_connection()
+                    if conn_count:
+                        try:
+                            cursor_count = conn_count.cursor()
+                            cursor_count.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", session_id)
+                            total_samples_tuple = cursor_count.fetchone()
+                            if total_samples_tuple:
+                                total_samples = total_samples_tuple[0]
+                        finally:
+                            conn_count.close()
+                    
+                    sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(leituras_para_grafico):].tolist()
+                    df_novos_dados_grafico = pd.DataFrame(leituras_para_grafico)
+                    labels_reais_ms = [d['timestamp'] for d in leituras_para_grafico]
+                    
+                    payload = {
+                        "sessionId": session_id,
+                        "metrics": {
+                            "total_amostras": total_samples,
+                            "intensidade_rms": intensidade_rms,
+                            "freq_dominante": freq_pico,
+                            "freq_pico_x": freq_pico_x,
+                            "freq_pico_y": freq_pico_y,
+                            "freq_pico_z": freq_pico_z
+                        },
+                        "charts": {
+                            "labels": labels_reais_ms,
+                            "x": (df_novos_dados_grafico['x'] - df_novos_dados_grafico['x'].mean()).tolist(),
+                            "y": (df_novos_dados_grafico['y'] - df_novos_dados_grafico['y'].mean()).tolist(),
+                            "z": (df_novos_dados_grafico['z'] - df_novos_dados_grafico['z'].mean()).tolist(),
+                            "sinal_filtrado": sinal_filtrado_para_grafico
+                        }
                     }
-                }
-                socketio.emit('session_update', payload, room=f'session_room_{session_id}')
+                    socketio.emit('session_update', payload, room=f'session_room_{session_id}')
+                    last_timestamp_sent[session_id] = leituras_para_grafico[-1]['timestamp']
 
-                # --- 5. SALVAMENTO DA ANÁLISE NO BANCO DE DADOS ---
+                # --- 5. SALVAMENTO DA ANÁLISE NO BANCO (Usa dados completos) ---
                 conn_insert = get_db_connection()
                 if conn_insert:
                     try:
                         cursor_insert = conn_insert.cursor()
                         ultimo_timestamp_sensor = int(df_analysis['timestamp'].iloc[-1])
                         sql_insert_analise = """
-                            INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms)
-                            VALUES (?, GETUTCDATE(), ?, ?, ?, ?, ?, ?);"""
-                        cursor_insert.execute(sql_insert_analise, int(session_id), intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, ultimo_timestamp_sensor)
+                            INSERT INTO analises_janela (
+                                sessao_id, timestamp_janela, intensidade_rms, freq_pico, 
+                                freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms
+                            )
+                            VALUES (?, GETUTCDATE(), ?, ?, ?, ?, ?, ?);
+                        """
+                        cursor_insert.execute(
+                            sql_insert_analise, 
+                            int(session_id), 
+                            intensidade_rms, 
+                            freq_pico, 
+                            freq_pico_x, 
+                            freq_pico_y, 
+                            freq_pico_z, 
+                            ultimo_timestamp_sensor
+                        )
                     finally:
                         conn_insert.close()
             except Exception as e:
                 print(f"Erro em process_and_push_update: {e}")
                 import traceback
                 traceback.print_exc()
+
 
 # <<< ALTERAÇÃO: Função de análise final adaptada para o modelo stateless >>>
 def process_final_batch(session_id):
@@ -676,6 +693,11 @@ def stop_session():
     session_id_to_stop = session_info.get('session_id')
     
     print(f"Sessão ativa encontrada: ID {session_id_to_stop} para o paciente '{patient_name}'.")
+
+    # <<< ALTERAÇÃO: Limpa o estado do timestamp para esta sessão para evitar problemas futuros >>>
+    if session_id_to_stop in last_timestamp_sent:
+        del last_timestamp_sent[session_id_to_stop]
+        print(f"Estado de timestamp para a sessão {session_id_to_stop} foi limpo.")
 
     if client_data and 'sid' in client_data:
         sid = client_data['sid']
