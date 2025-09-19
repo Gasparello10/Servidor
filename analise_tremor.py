@@ -40,8 +40,8 @@ TEMPO_REQUISICAO_MS = 500 # Intervalo entre atualizações no dashboard (ms) - A
 # --- Configurações de banco de dados ---
 CONN_STR = (
     r'DRIVER={ODBC Driver 17 for SQL Server};'
-    #r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
-    r'SERVER=localhost;'
+    r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
+    #r'SERVER=localhost;'
     r'DATABASE=AnaliseTremorDB_Teste;'
     r'Trusted_Connection=yes;'
 )
@@ -109,6 +109,7 @@ def process_and_push_update(session_id, novas_leituras):
                     if not conn_context: return
                     try:
                         cursor_context = conn_context.cursor()
+                        #ponto de gargalo
                         sql_context = f"""
                             SELECT TOP ({num_leituras_necessarias_db}) timestamp_ms, x, y, z 
                             FROM leituras 
@@ -532,7 +533,7 @@ def receber_dados():
             cursor.execute("SELECT id FROM sessoes WHERE id = ?", sessao_id)
             if not cursor.fetchone():
                 return jsonify({"status": "erro", "message": f"Sessão com ID {sessao_id} não encontrada."}), 404
-
+            #ponto de gargalo
             # Salva todos os dados brutos de uma vez
             params = [(sessao_id, int(l['timestamp']), l.get('x'), l.get('y'), l.get('z')) for l in leituras_validas]
             sql = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
