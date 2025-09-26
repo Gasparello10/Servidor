@@ -14,8 +14,10 @@ import pyodbc
 from datetime import datetime, timedelta
 import math 
 from collections import deque
-from threading import Lock
+from threading import Lock, Thread # <<< ALTERADO >>> Adicionado Thread
+from queue import Queue # <<< NOVA IMPLEMENTAÇÃO >>> Fila para inserções no BD
 import pytz
+
 
 # ==========================
 # CONFIGURAÇÕES GLOBAIS
@@ -27,10 +29,12 @@ FREQ_CORTE_ALTA = 8.0             # Hz
 JANELA_DE_ANALISE = 1000          # Nº de amostras para cálculo de RMS e Welch
 NPERSEG_WELCH = 512 
 
-# <<< ALTERAÇÃO: O cache global foi removido. Era a fonte do problema de contaminação de dados. >>>
-# cache_sessoes = {}
-session_locks = defaultdict(Lock)
+
+SESSAO_CACHE = {}
+
+SESSAO_LOCKS  = defaultdict(Lock)
 last_timestamp_sent = {}
+DB_INSERT_QUEUE = Queue()
 
 # --- Configurações do servidor ---
 HOST = '0.0.0.0'
@@ -40,8 +44,8 @@ TEMPO_REQUISICAO_MS = 500 # Intervalo entre atualizações no dashboard (ms) - A
 # --- Configurações de banco de dados ---
 CONN_STR = (
     r'DRIVER={ODBC Driver 17 for SQL Server};'
-    r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
-    #r'SERVER=localhost;'
+    #r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
+    r'SERVER=localhost;'
     r'DATABASE=AnaliseTremorDB_Teste;'
     r'Trusted_Connection=yes;'
 )
@@ -64,11 +68,88 @@ active_sessions = {}
 # --- LÓGICA DE BANCO DE DADOS ---
 def get_db_connection():
     try:
-        return pyodbc.connect(CONN_STR, autocommit=True)
+        # <<< ALTERADO: autocommit=False para que o worker controle a transação >>>
+        return pyodbc.connect(CONN_STR, autocommit=False)
     except Exception as e:
         print(f"Erro ao conectar ao banco de dados: {e}")
         return None
 
+# <<< NOVA IMPLEMENTAÇÃO: WORKER PARA O BANCO DE DADOS >>>
+def database_writer_job():
+    """
+    Esta função roda em uma thread separada. Ela consome itens da
+    fila DB_INSERT_QUEUE e os insere no banco em lotes.
+    """
+    leituras_batch = []
+    analises_batch = []
+    bateria_batch = []
+    
+    while True:
+        try:
+            # Pega o primeiro item, bloqueando a thread se a fila estiver vazia
+            item_type, data = DB_INSERT_QUEUE.get()
+            
+            # Agrupa os itens por tipo
+            if item_type == 'leitura':
+                leituras_batch.append(data)
+            elif item_type == 'analise':
+                analises_batch.append(data)
+            elif item_type == 'bateria':
+                bateria_batch.append(data)
+
+            # Processa em lotes: Se a fila tiver mais itens, pega mais alguns antes de salvar
+            while not DB_INSERT_QUEUE.empty() and (len(leituras_batch) + len(analises_batch) + len(bateria_batch)) < 500:
+                item_type, data = DB_INSERT_QUEUE.get_nowait()
+                if item_type == 'leitura':
+                    leituras_batch.append(data)
+                elif item_type == 'analise':
+                    analises_batch.append(data)
+                elif item_type == 'bateria':
+                    bateria_batch.append(data)
+
+            conn = get_db_connection()
+            if not conn:
+                print("Worker de BD: Falha na conexão. Tentando novamente mais tarde.")
+                time.sleep(5)
+                continue
+
+            cursor = conn.cursor()
+            
+            try:
+                # Insere leituras se houver
+                if leituras_batch:
+                    sql_leituras = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
+                    cursor.executemany(sql_leituras, leituras_batch)
+                    leituras_batch.clear()
+
+                # Insere análises se houver
+                if analises_batch:
+                    sql_analises = """
+                        INSERT INTO analises_janela (
+                            sessao_id, timestamp_janela, intensidade_rms, freq_pico, 
+                            freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms
+                        ) VALUES (?, GETUTCDATE(), ?, ?, ?, ?, ?, ?);
+                    """
+                    cursor.executemany(sql_analises, analises_batch)
+                    analises_batch.clear()
+
+                # Insere leituras de bateria se houver
+                if bateria_batch:
+                    sql_bateria = "INSERT INTO leituras_bateria (sessao_id, timestamp_leitura, nivel_bateria) VALUES (?, ?, ?)"
+                    cursor.executemany(sql_bateria, bateria_batch)
+                    bateria_batch.clear()
+
+                conn.commit()
+            except pyodbc.Error as e:
+                print(f"BD Worker ERRO: {e}")
+                conn.rollback()
+            finally:
+                conn.close()
+
+        except Exception as e:
+            print(f"Erro no loop principal do BD Worker: {e}")
+            time.sleep(2)
+            
 # --- Funções de Análise ---
 def filtrar_sinal_passa_faixa(sinal, freq_corte_baixa, freq_corte_alta, taxa_amostragem):
     if len(sinal) < 34: return np.array([])
@@ -87,139 +168,95 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 
 def process_and_push_update(session_id, novas_leituras):
     """
-    Processa um lote de dados, salva a análise completa no banco, mas envia
-    apenas os dados cronologicamente novos para a visualização em tempo real.
+    Processa dados usando o CACHE em memória, envia atualização para o dashboard
+    e coloca o resultado da análise na FILA de inserção.
     """
     if not novas_leituras:
         return
 
-    # Garante que o lote atual está em ordem cronológica
+    # Garante que as leituras para o gráfico estejam em ordem
     novas_leituras.sort(key=lambda x: x['timestamp'])
+    
+    janela_completa_copia = []
+    # Pega uma cópia da janela de dados atual do cache para análise.
+    # Isso é feito dentro de um lock para garantir que não estamos lendo enquanto outra thread escreve.
+    with SESSAO_LOCKS[session_id]:
+        if SESSAO_CACHE.get(session_id):
+            janela_completa_copia = list(SESSAO_CACHE[session_id])
+    
+    # Se não houver dados suficientes no cache, não faz nada.
+    if len(janela_completa_copia) < 34:
+        return
 
-    with session_locks[session_id]:
-        with app.app_context():
-            try:
-                # --- 1. Busca o contexto histórico e constrói a janela de análise ---
-                min_ts_in_chunk = novas_leituras[0]['timestamp']
-                num_leituras_necessarias_db = JANELA_DE_ANALISE - len(novas_leituras)
-                
-                leituras_contexto_db = []
-                if num_leituras_necessarias_db > 0:
-                    conn_context = get_db_connection()
-                    if not conn_context: return
-                    try:
-                        cursor_context = conn_context.cursor()
-                        #ponto de gargalo
-                        sql_context = f"""
-                            SELECT TOP ({num_leituras_necessarias_db}) timestamp_ms, x, y, z 
-                            FROM leituras 
-                            WHERE sessao_id = ? AND timestamp_ms < ? 
-                            ORDER BY timestamp_ms DESC
-                        """
-                        cursor_context.execute(sql_context, session_id, min_ts_in_chunk)
-                        rows = cursor_context.fetchall()
-                        rows.reverse()
-                        leituras_contexto_db = [{'timestamp': r.timestamp_ms, 'x': r.x, 'y': r.y, 'z': r.z} for r in rows]
-                    finally:
-                        conn_context.close()
+    try:
+        # --- 1. ANÁLISE (Usa a janela completa do cache) ---
+        # A leitura do banco foi REMOVIDA daqui. É a principal otimização.
+        df_analysis = pd.DataFrame(janela_completa_copia)
+        
+        x_centered = df_analysis['x'] - df_analysis['x'].mean()
+        y_centered = df_analysis['y'] - df_analysis['y'].mean()
+        z_centered = df_analysis['z'] - df_analysis['z'].mean()
+        df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
+        
+        sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
 
-                janela_completa = leituras_contexto_db + novas_leituras
-                
-                if len(janela_completa) < 34:
-                    return
+        intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
+        freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
+        freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
+        freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
+        freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
 
-                # --- 2. ANÁLISE UNIFICADA (Usa a janela completa) ---
-                df_analysis = pd.DataFrame(janela_completa)
-                
-                x_centered = df_analysis['x'] - df_analysis['x'].mean()
-                y_centered = df_analysis['y'] - df_analysis['y'].mean()
-                z_centered = df_analysis['z'] - df_analysis['z'].mean()
-                df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
-                
-                sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-                sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-                sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-                sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
+        # --- 2. PREPARAÇÃO E ENVIO PARA O DASHBOARD ---
+        ultimo_ts_enviado = last_timestamp_sent.get(session_id, 0)
+        leituras_para_grafico = [leitura for leitura in novas_leituras if leitura['timestamp'] > ultimo_ts_enviado]
 
-                intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
-                freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
-                freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
-                freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
-                freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
+        if leituras_para_grafico:
+            sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(leituras_para_grafico):].tolist()
+            df_novos_dados_grafico = pd.DataFrame(leituras_para_grafico)
+            labels_reais_ms = [d['timestamp'] for d in leituras_para_grafico]
+            
+            payload = {
+                "sessionId": session_id,
+                "metrics": {
+                    "total_amostras": len(df_analysis), # Usamos o tamanho do cache como aproximação
+                    "intensidade_rms": intensidade_rms,
+                    "freq_dominante": freq_pico,
+                    "freq_pico_x": freq_pico_x,
+                    "freq_pico_y": freq_pico_y,
+                    "freq_pico_z": freq_pico_z
+                },
+                "charts": {
+                    "labels": labels_reais_ms,
+                    "x": (df_novos_dados_grafico['x'] - df_novos_dados_grafico['x'].mean()).tolist(),
+                    "y": (df_novos_dados_grafico['y'] - df_novos_dados_grafico['y'].mean()).tolist(),
+                    "z": (df_novos_dados_grafico['z'] - df_novos_dados_grafico['z'].mean()).tolist(),
+                    "sinal_filtrado": sinal_filtrado_para_grafico
+                }
+            }
+            socketio.emit('session_update', payload, room=f'session_room_{session_id}')
+            last_timestamp_sent[session_id] = leituras_para_grafico[-1]['timestamp']
 
-                # --- 3. FILTRAGEM APENAS PARA VISUALIZAÇÃO EM TEMPO REAL ---
-                ultimo_ts_enviado = last_timestamp_sent.get(session_id, 0)
-                leituras_para_grafico = [leitura for leitura in novas_leituras if leitura['timestamp'] > ultimo_ts_enviado]
+        # --- 3. ADICIONA RESULTADO DA ANÁLISE NA FILA DO BANCO ---
+        # A inserção direta no banco foi REMOVIDA daqui.
+        ultimo_timestamp_sensor = int(df_analysis['timestamp'].iloc[-1])
+        analise_data = (
+            int(session_id), 
+            intensidade_rms, 
+            freq_pico, 
+            freq_pico_x, 
+            freq_pico_y, 
+            freq_pico_z, 
+            ultimo_timestamp_sensor
+        )
+        DB_INSERT_QUEUE.put(('analise', analise_data))
 
-                if leituras_para_grafico:
-                    # --- 4. PREPARAÇÃO DO PAYLOAD PARA O DASHBOARD ---
-                    total_samples = 0
-                    conn_count = get_db_connection()
-                    if conn_count:
-                        try:
-                            cursor_count = conn_count.cursor()
-                            cursor_count.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", session_id)
-                            total_samples_tuple = cursor_count.fetchone()
-                            if total_samples_tuple:
-                                total_samples = total_samples_tuple[0]
-                        finally:
-                            conn_count.close()
-                    
-                    sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(leituras_para_grafico):].tolist()
-                    df_novos_dados_grafico = pd.DataFrame(leituras_para_grafico)
-                    labels_reais_ms = [d['timestamp'] for d in leituras_para_grafico]
-                    
-                    payload = {
-                        "sessionId": session_id,
-                        "metrics": {
-                            "total_amostras": total_samples,
-                            "intensidade_rms": intensidade_rms,
-                            "freq_dominante": freq_pico,
-                            "freq_pico_x": freq_pico_x,
-                            "freq_pico_y": freq_pico_y,
-                            "freq_pico_z": freq_pico_z
-                        },
-                        "charts": {
-                            "labels": labels_reais_ms,
-                            "x": (df_novos_dados_grafico['x'] - df_novos_dados_grafico['x'].mean()).tolist(),
-                            "y": (df_novos_dados_grafico['y'] - df_novos_dados_grafico['y'].mean()).tolist(),
-                            "z": (df_novos_dados_grafico['z'] - df_novos_dados_grafico['z'].mean()).tolist(),
-                            "sinal_filtrado": sinal_filtrado_para_grafico
-                        }
-                    }
-                    socketio.emit('session_update', payload, room=f'session_room_{session_id}')
-                    last_timestamp_sent[session_id] = leituras_para_grafico[-1]['timestamp']
-
-                # --- 5. SALVAMENTO DA ANÁLISE NO BANCO (Usa dados completos) ---
-                conn_insert = get_db_connection()
-                if conn_insert:
-                    try:
-                        cursor_insert = conn_insert.cursor()
-                        ultimo_timestamp_sensor = int(df_analysis['timestamp'].iloc[-1])
-                        sql_insert_analise = """
-                            INSERT INTO analises_janela (
-                                sessao_id, timestamp_janela, intensidade_rms, freq_pico, 
-                                freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms
-                            )
-                            VALUES (?, GETUTCDATE(), ?, ?, ?, ?, ?, ?);
-                        """
-                        cursor_insert.execute(
-                            sql_insert_analise, 
-                            int(session_id), 
-                            intensidade_rms, 
-                            freq_pico, 
-                            freq_pico_x, 
-                            freq_pico_y, 
-                            freq_pico_z, 
-                            ultimo_timestamp_sensor
-                        )
-                    finally:
-                        conn_insert.close()
-            except Exception as e:
-                print(f"Erro em process_and_push_update: {e}")
-                import traceback
-                traceback.print_exc()
-
+    except Exception as e:
+        print(f"Erro CRÍTICO em process_and_push_update: {e}")
+        import traceback
+        traceback.print_exc()
 
 # <<< ALTERAÇÃO: Função de análise final adaptada para o modelo stateless >>>
 def process_final_batch(session_id):
@@ -265,50 +302,61 @@ def emit_state_update():
 def dashboard():
     return render_template('dashboard.html', tempo_requisicao_ms=TEMPO_REQUISICAO_MS)
 
-
-
-@app.route('/battery_data', methods=['POST'])
-def receber_dados_bateria():
-    """
-    Recebe um lote de leituras de bateria do celular e salva no banco de dados.
-    """
+@app.route('/data', methods=['POST'])
+def receber_dados():
     try:
         payload = request.get_json()
         if not payload or 'sessao_id' not in payload or 'data' not in payload:
             return jsonify({"status": "erro", "message": "Payload inválido"}), 400
 
         sessao_id = int(payload['sessao_id'])
-        dados_bateria = payload['data']
+        dados_leituras = payload['data']
         
-        if not dados_bateria:
-            return jsonify({"status": "sucesso", "message": "Nenhum dado de bateria para inserir"}), 200
+        if not dados_leituras:
+            return jsonify({"status": "aceito", "message": "Nenhum dado para processar"}), 202
 
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
-        
-        cursor = conn.cursor()
-        
-        params = []
-        for leitura in dados_bateria:
-            ts_unix = leitura.get('timestamp') / 1000
-            ts_datetime = datetime.fromtimestamp(ts_unix)
-            params.append((sessao_id, ts_datetime, leitura.get('batteryLevel')))
+        leituras_validas = [l for l in dados_leituras if l.get('timestamp')]
+        if not leituras_validas:
+            return jsonify({"status": "aceito", "message": "Nenhum dado válido"}), 202
 
-        sql = "INSERT INTO leituras_bateria (sessao_id, timestamp_leitura, nivel_bateria) VALUES (?, ?, ?)"
-        cursor.executemany(sql, params)
+        # --- 1. COLOCA OS DADOS BRUTOS NA FILA DE INSERÇÃO ---
+        # Esta operação é muito rápida e não bloqueia a requisição.
+        for l in leituras_validas:
+            params = (sessao_id, int(l['timestamp']), l.get('x'), l.get('y'), l.get('z'))
+            DB_INSERT_QUEUE.put(('leitura', params))
+
+        # --- 2. ATUALIZA O CACHE EM MEMÓRIA COM OS NOVOS DADOS ---
+        # A lógica aqui garante que dados antigos (de reconexão) sejam inseridos na ordem correta.
+        with SESSAO_LOCKS[sessao_id]:
+            cache_deque = SESSAO_CACHE.get(sessao_id)
+            if cache_deque is not None:
+                # Converte o deque para uma lista para poder ordenar
+                leituras_atuais = list(cache_deque)
+                leituras_atuais.extend(leituras_validas)
+                # Ordena pela timestamp para garantir a ordem cronológica
+                leituras_atuais.sort(key=lambda x: x['timestamp'])
+                # Pega apenas as últimas 'JANELA_DE_ANALISE' amostras
+                leituras_janela_final = leituras_atuais[-JANELA_DE_ANALISE:]
+                # Atualiza o cache com um novo deque
+                SESSAO_CACHE[sessao_id] = deque(leituras_janela_final, maxlen=JANELA_DE_ANALISE)
         
-        print(f"Sucesso: {len(dados_bateria)} leituras de bateria inseridas para a sessão {sessao_id}.")
-        return jsonify({"status": "sucesso"}), 201
+        # --- 3. DISPARA A ANÁLISE EM BACKGROUND ---
+        # A análise usará o cache atualizado, sem precisar ler do banco.
+        leituras_validas.sort(key=lambda x: x['timestamp'])
+        socketio.start_background_task(
+            target=process_and_push_update, 
+            session_id=sessao_id, 
+            novas_leituras=leituras_validas # Envia apenas o lote novo para o gráfico
+        )
+        
+        # Responde imediatamente ao cliente. O status 202 significa "Aceito para processamento".
+        return jsonify({"status": "aceito"}), 202
 
     except Exception as e:
         import traceback
-        print(f"ERRO INESPERADO em /battery_data: {e}")
+        print(f"ERRO INESPERADO em /data: {e}")
         traceback.print_exc()
         return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
-    finally:
-        if 'conn' in locals() and conn:
-            conn.close()
 
 @app.route('/api/battery_history')
 def get_battery_history():
@@ -501,71 +549,6 @@ def get_historical_data():
 
 
 
-
-# <<< ALTERAÇÃO: Rota de dados modificada para fatiar pacotes grandes >>>
-@app.route('/data', methods=['POST'])
-def receber_dados():
-    try:
-        payload = request.get_json()
-        if not payload or 'patientId' not in payload or 'sessao_id' not in payload or 'data' not in payload:
-            return jsonify({"status": "erro", "message": "Payload inválido"}), 400
-
-        sessao_id = int(payload['sessao_id'])
-        dados_leituras = payload['data']
-        
-        if not dados_leituras:
-            return jsonify({"status": "sucesso", "message": "Nenhum dado para inserir"}), 200
-
-        # Valida os dados para garantir que tenham timestamp
-        leituras_validas = [l for l in dados_leituras if l.get('timestamp') and isinstance(l.get('timestamp'), (int, float)) and l.get('timestamp') > 0]
-        if len(leituras_validas) != len(dados_leituras):
-            print(f"AVISO: {len(dados_leituras) - len(leituras_validas)} leituras descartadas por timestamp inválido na sessão {sessao_id}.")
-        if not leituras_validas:
-            return jsonify({"status": "sucesso", "message": "Nenhum dado válido para inserir"}), 200
-
-        conn = get_db_connection()
-        if not conn:
-            return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
-        
-        try:
-            cursor = conn.cursor()
-            
-            cursor.execute("SELECT id FROM sessoes WHERE id = ?", sessao_id)
-            if not cursor.fetchone():
-                return jsonify({"status": "erro", "message": f"Sessão com ID {sessao_id} não encontrada."}), 404
-            #ponto de gargalo
-            # Salva todos os dados brutos de uma vez
-            params = [(sessao_id, int(l['timestamp']), l.get('x'), l.get('y'), l.get('z')) for l in leituras_validas]
-            sql = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
-            cursor.executemany(sql, params)
-            
-            # Processa os dados em pedaços para gerar análises granulares
-            TAMANHO_LOTE_ANALISE = 250  # Processa a cada 10 segundos de dados (250 amostras)
-            leituras_validas.sort(key=lambda x: x['timestamp'])
-
-            for i in range(0, len(leituras_validas), TAMANHO_LOTE_ANALISE):
-                chunk = leituras_validas[i:i + TAMANHO_LOTE_ANALISE]
-                socketio.start_background_task(
-                    target=process_and_push_update, 
-                    session_id=sessao_id, 
-                    novas_leituras=chunk
-                )
-            
-            print(f"Sucesso: {len(leituras_validas)} leituras inseridas e agendadas para análise para a sessão {sessao_id}.")
-            return jsonify({"status": "sucesso"}), 201
-
-        finally:
-            if conn:
-                conn.close()
-
-    except pyodbc.Error as db_err:
-        print(f"ERRO DE BANCO DE DADOS em /data: {db_err}")
-        return jsonify({"status": "erro", "message": "Erro de banco de dados"}), 500
-    except Exception as e:
-        import traceback
-        print(f"ERRO INESPERADO em /data: {e}")
-        traceback.print_exc()
-        return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
         
 @app.route('/api/initial_session_data')
 def initial_session_data():
@@ -618,7 +601,7 @@ def initial_session_data():
         return jsonify({"error": str(e)}), 500
     finally:
         conn.close()
-        
+
 @app.route('/api/start_session', methods=['POST'])
 def start_session():
     data = request.get_json()
@@ -651,9 +634,14 @@ def start_session():
 
         cursor.execute("INSERT INTO sessoes (paciente_id, timestamp_inicio) OUTPUT INSERTED.id VALUES (?, GETDATE())", paciente_id)
         nova_sessao_id = cursor.fetchone().id
-    
-        # <<< ALTERAÇÃO: A inicialização do cache foi removida daqui. >>>
-
+        
+        # Como o autocommit está desativado, precisamos confirmar a transação.
+        conn.commit()
+ 
+        # <<< NOVA IMPLEMENTAÇÃO: INICIALIZA O CACHE PARA A SESSÃO >>>
+        with SESSAO_LOCKS[nova_sessao_id]:
+            SESSAO_CACHE[nova_sessao_id] = deque(maxlen=JANELA_DE_ANALISE)
+            
         active_sessions[patient_name_for_dict] = {
             'patient_id': paciente_id,
             'session_id': nova_sessao_id,
@@ -664,10 +652,14 @@ def start_session():
         socketio.emit('session_started', {'patientId': paciente_id, 'sessionId': nova_sessao_id}, room='dashboards')
         emit_state_update()
 
-        print(f"Sessão {nova_sessao_id} iniciada para o paciente '{patient_name_for_dict}' (ID: {paciente_id})")
+        print(f"Sessão {nova_sessao_id} iniciada para o paciente '{patient_name_for_dict}' (ID: {paciente_id}). Cache criado.")
         return jsonify({"status": "sucesso", "message": "Sessão iniciada e registrada no banco."})
-    except Exception as e: return jsonify({"status": "erro", "message": str(e)}), 500
-    finally: conn.close()
+
+    except Exception as e: 
+        conn.rollback() # Desfaz a transação em caso de erro
+        return jsonify({"status": "erro", "message": str(e)}), 500
+    finally: 
+        conn.close()
 
 @app.route('/api/stop_session', methods=['POST'])
 def stop_session():
@@ -680,26 +672,31 @@ def stop_session():
         print("[ERRO] 'patientId' (nome do paciente) não foi fornecido no corpo da requisição.")
         return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
     
-    client_data = connected_clients.get(patient_name)
-    if not client_data:
-        print(f"[AVISO] Paciente '{patient_name}' não encontrado em `connected_clients`.")
-    
     if patient_name not in active_sessions:
         print(f"[AVISO] Nenhuma sessão ativa encontrada para '{patient_name}'.")
+        # Mesmo sem sessão ativa, atualiza a UI para garantir consistência.
         emit_state_update()
         socketio.emit('structure_changed')
         return jsonify({"status": "sucesso", "message": "Nenhuma sessão ativa para parar, estado da UI atualizado."})
 
-    session_info = active_sessions[patient_name]
+    session_info = active_sessions.pop(patient_name) # Remove da lista de ativas
     session_id_to_stop = session_info.get('session_id')
     
     print(f"Sessão ativa encontrada: ID {session_id_to_stop} para o paciente '{patient_name}'.")
 
-    # <<< ALTERAÇÃO: Limpa o estado do timestamp para esta sessão para evitar problemas futuros >>>
+    # <<< NOVA IMPLEMENTAÇÃO: LIMPA O CACHE E O ESTADO DA SESSÃO >>>
+    with SESSAO_LOCKS[session_id_to_stop]:
+        if session_id_to_stop in SESSAO_CACHE:
+            # Opcional: Aqui você poderia pegar os últimos dados do cache para uma análise final
+            # antes de deletar.
+            del SESSAO_CACHE[session_id_to_stop]
+            print(f"Cache para a sessão {session_id_to_stop} foi limpo.")
+
     if session_id_to_stop in last_timestamp_sent:
         del last_timestamp_sent[session_id_to_stop]
         print(f"Estado de timestamp para a sessão {session_id_to_stop} foi limpo.")
 
+    client_data = connected_clients.get(patient_name)
     if client_data and 'sid' in client_data:
         sid = client_data['sid']
         socketio.emit('stop_monitoring', room=sid)
@@ -707,10 +704,10 @@ def stop_session():
     else:
         print("Nenhum cliente conectado encontrado para enviar o comando 'stop_monitoring'.")
 
-    # <<< ALTERAÇÃO: A lógica de cache foi removida daqui, apenas a análise final é chamada. >>>
-    socketio.start_background_task(process_final_batch, session_id_to_stop)
+    # A sua função 'process_final_batch' ainda pode ser útil se você quiser
+    # garantir que os últimos dados enviados para a fila sejam analisados.
+    # socketio.start_background_task(process_final_batch, session_id_to_stop)
     
-    del active_sessions[patient_name]
     print(f"Sessão do paciente '{patient_name}' removida da lista de ativas.")
 
     emit_state_update()
@@ -718,6 +715,7 @@ def stop_session():
     
     print("--- FIM DA OPERAÇÃO DE PARADA DE SESSÃO ---")
     return jsonify({"status": "sucesso", "message": "Comando de parada processado."})
+
 
 @socketio.on('connect')
 def handle_connect(): print(f"Novo cliente conectado: {request.sid}")
@@ -864,6 +862,15 @@ if __name__ == '__main__':
     host = HOST
     port = PORT
     local_ip = get_ip()
+
+    # <<< NOVA IMPLEMENTAÇÃO: INICIA A(S) THREAD(S) DO BANCO DE DADOS >>>
+    print("Iniciando workers de banco de dados...")
+    num_db_workers = 2 # Você pode ajustar este número
+    for i in range(num_db_workers):
+        worker = Thread(target=database_writer_job, daemon=True)
+        worker.start()
+        print(f"  - Worker {i+1} iniciado.")
+
     print("="*60)
     print(">>> SERVIDOR DE CONTROLE E ANÁLISE INICIADO <<<")
     print(f"Dashboard disponível em: http://{local_ip}:{port}")
