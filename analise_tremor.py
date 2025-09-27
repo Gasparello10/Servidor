@@ -31,7 +31,7 @@ NPERSEG_WELCH = 512
 
 
 SESSAO_CACHE = {}
-
+#SESSAO_COUNTERS = {}
 SESSAO_LOCKS  = defaultdict(Lock)
 last_timestamp_sent = {}
 DB_INSERT_QUEUE = Queue()
