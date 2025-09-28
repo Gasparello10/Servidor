@@ -278,23 +278,22 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
     pico_idx = np.argmax(psd[1:]) + 1
     return freqs[pico_idx]
 
-def process_and_push_update(session_id, novas_leituras):
-    if not novas_leituras:
-        return
 
-    novas_leituras.sort(key=lambda x: x['timestamp'])
-    
+def process_and_push_update(session_id, novas_leituras):
+    """
+    Processa dados usando o CACHE em memória, envia uma atualização COMPLETA
+    para o dashboard e enfileira o resultado da análise para o banco.
+    """
     janela_completa_copia = []
     with SESSAO_LOCKS[session_id]:
         if SESSAO_CACHE.get(session_id):
             janela_completa_copia = list(SESSAO_CACHE[session_id])
     
-    if len(janela_completa_copia) < 34:
+    if len(janela_completa_copia) < 34: 
         return
 
     try:
         df_analysis = pd.DataFrame(janela_completa_copia)
-        
         x_centered = df_analysis['x'] - df_analysis['x'].mean()
         y_centered = df_analysis['y'] - df_analysis['y'].mean()
         z_centered = df_analysis['z'] - df_analysis['z'].mean()
@@ -310,79 +309,43 @@ def process_and_push_update(session_id, novas_leituras):
         freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
         freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
         freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
-
-        # <<< MUDANÇA: Pega o total de amostras do nosso contador em memória >>>
-        total_amostras_reais = SESSAO_COUNTERS.get(session_id, len(df_analysis)) # Usa len(df_analysis) como fallback
-
-        ultimo_ts_enviado = last_timestamp_sent.get(session_id, 0)
-        leituras_para_grafico = [leitura for leitura in novas_leituras if leitura['timestamp'] > ultimo_ts_enviado]
-
-        if leituras_para_grafico:
-            sinal_filtrado_para_grafico = sinal_magnitude_filtrado[-len(leituras_para_grafico):].tolist()
-            df_novos_dados_grafico = pd.DataFrame(leituras_para_grafico)
-            labels_reais_ms = [d['timestamp'] for d in leituras_para_grafico]
-            
-            payload = {
-                "sessionId": session_id,
-                "metrics": {
-                    # <<< MUDANÇA: Usa o contador real no payload >>>
-                    "total_amostras": total_amostras_reais,
-                    "intensidade_rms": intensidade_rms,
-                    "freq_dominante": freq_pico,
-                    "freq_pico_x": freq_pico_x,
-                    "freq_pico_y": freq_pico_y,
-                    "freq_pico_z": freq_pico_z
-                },
-                "charts": {
-                    "labels": labels_reais_ms,
-                    "x": (df_novos_dados_grafico['x'] - df_novos_dados_grafico['x'].mean()).tolist(),
-                    "y": (df_novos_dados_grafico['y'] - df_novos_dados_grafico['y'].mean()).tolist(),
-                    "z": (df_novos_dados_grafico['z'] - df_novos_dados_grafico['z'].mean()).tolist(),
-                    "sinal_filtrado": sinal_filtrado_para_grafico
-                }
+        
+        total_amostras_reais = SESSAO_COUNTERS.get(session_id, len(df_analysis))
+        
+        room_name = f'session_room_{session_id}'
+        payload = {
+            "sessionId": session_id,
+            "metrics": {
+                "total_amostras": total_amostras_reais, "intensidade_rms": intensidade_rms, "freq_dominante": freq_pico,
+                "freq_pico_x": freq_pico_x, "freq_pico_y": freq_pico_y, "freq_pico_z": freq_pico_z
+            },
+            "charts": {
+                "labels": df_analysis['timestamp'].tolist(),
+                "x": x_centered.tolist(), "y": y_centered.tolist(), "z": z_centered.tolist(),
+                "sinal_filtrado": sinal_magnitude_filtrado.tolist()
             }
-            socketio.emit('session_update', payload, room=f'session_room_{session_id}')
-            last_timestamp_sent[session_id] = leituras_para_grafico[-1]['timestamp']
+        }
 
+        # <<< PRINT DE DEPURAÇÃO ADICIONADO AQUI >>>
+        print(f"[DEPURAÇÃO GRÁFICO] Enviando para sala '{room_name}': "
+              f"Labels: {len(payload['charts']['labels'])}, "
+              f"X: {len(payload['charts']['x'])}, "
+              f"Y: {len(payload['charts']['y'])}, "
+              f"Z: {len(payload['charts']['z'])}, "
+              f"Filtrado: {len(payload['charts']['sinal_filtrado'])}")
+
+        socketio.emit('session_update', payload, room=room_name)
+        
         ultimo_timestamp_sensor = int(df_analysis['timestamp'].iloc[-1])
-        analise_data = (
-            int(session_id), 
-            intensidade_rms, 
-            freq_pico, 
-            freq_pico_x, 
-            freq_pico_y, 
-            freq_pico_z, 
-            ultimo_timestamp_sensor
-        )
-        DB_INSERT_QUEUE.put(('analise', analise_data))
+        analise_data = (session_id, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, ultimo_timestamp_sensor)
+        DB_REALTIME_QUEUE.put(('analise', analise_data))
 
     except Exception as e:
         print(f"Erro CRÍTICO em process_and_push_update: {e}")
         import traceback
         traceback.print_exc()
 
-# <<< ALTERAÇÃO: Função de análise final adaptada para o modelo stateless >>>
-def process_final_batch(session_id):
-    print(f"Executando análise final para a sessão {session_id}...")
-    conn = get_db_connection()
-    if not conn: return
-    try:
-        cursor = conn.cursor()
-        # Pega o último pedaço de dados que talvez não tenha formado um lote completo de análise
-        sql_last_data = f"SELECT TOP ({250}) timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms DESC"
-        cursor.execute(sql_last_data, session_id)
-        rows = cursor.fetchall()
-        rows.reverse()
-        if rows:
-            last_readings = [{'timestamp': r.timestamp_ms, 'x': r.x, 'y': r.y, 'z': r.z} for r in rows]
-            process_and_push_update(session_id, last_readings)
-            print(f"Análise final para a sessão {session_id} concluída.")
-    except Exception as e:
-            print(f"Erro CRÍTICO durante a análise final da sessão {session_id}: {e}")
-            import traceback
-            traceback.print_exc()
-    finally:
-        conn.close()
+
 
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
@@ -1014,7 +977,6 @@ def handle_watch_status(data):
                     conn.close()
 
         emit_state_update()
-
 @socketio.on('disconnect')
 def handle_disconnect():
     print(f"Cliente desconectado: {request.sid}")
@@ -1029,29 +991,35 @@ def handle_disconnect():
         print(f"Paciente '{disconnected_patient}' removido da lista de online.")
 
         if disconnected_patient in active_sessions:
-            session_id_to_stop = active_sessions[disconnected_patient].get('session_id')
-            # <<< ALTERAÇÃO: A lógica de cache foi removida daqui, apenas a análise final é chamada. >>>
+            session_info = active_sessions.pop(disconnected_patient)
+            session_id_to_stop = session_info.get('session_id')
+            
+            # <<< CORREÇÃO: Usa a nova função de análise histórica completa >>>
+            # Em vez de chamar a antiga 'process_final_batch', garantimos uma análise completa.
             if session_id_to_stop:
-                process_final_batch(session_id_to_stop)
-            del active_sessions[disconnected_patient]
+                print(f"Agendando análise histórica final para a sessão {session_id_to_stop} devido à desconexão.")
+                socketio.start_background_task(analisar_dados_historicos, session_id=session_id_to_stop)
+
             print(f"Sessão do paciente desconectado '{disconnected_patient}' removida da lista de ativas.")
 
         emit_state_update()
-        
+
 @socketio.on('session_stopped_by_client')
-def handle_session_stopped(data):
-    patient_name = data.get('patientId')
+def handle_session_stopped(by_client_data):
+    patient_name = by_client_data.get('patientId')
     if not patient_name:
         return
 
     print(f"Recebido evento 'session_stopped_by_client' para o paciente: {patient_name}")
     
     if patient_name in active_sessions:
-        session_id_to_stop = active_sessions[patient_name].get('session_id')
-        # <<< ALTERAÇÃO: A lógica de cache foi removida daqui, apenas a análise final é chamada. >>>
+        session_info = active_sessions.pop(patient_name)
+        session_id_to_stop = session_info.get('session_id')
+        
+        # <<< CORREÇÃO: Usa a nova função de análise histórica completa >>>
         if session_id_to_stop:
-            process_final_batch(session_id_to_stop)
-        del active_sessions[patient_name]
+            print(f"Agendando análise histórica final para a sessão {session_id_to_stop} (parada pelo cliente).")
+            socketio.start_background_task(analisar_dados_historicos, session_id=session_id_to_stop)
         
         emit_state_update() 
         print(f"Sessão do paciente '{patient_name}' removida da lista de ativas via app.")
@@ -1068,8 +1036,28 @@ def handle_resume_session(data):
 
     conn = get_db_connection()
     if not conn: return
-    cursor = conn.cursor()
+    
+    total_amostras_db = 0
     try:
+        # <<< CORREÇÃO: Busca o total de amostras já salvas no banco de dados >>>
+        cursor_count = conn.cursor()
+        cursor_count.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", session_id)
+        result = cursor_count.fetchone()
+        if result:
+            total_amostras_db = result[0]
+        print(f"Sessão {session_id}: Encontradas {total_amostras_db} amostras existentes no banco de dados.")
+    except Exception as e:
+        print(f"Erro ao buscar contagem de amostras para a sessão {session_id}: {e}")
+
+    # <<< CORREÇÃO: Recria o cache e INICIALIZA o contador com o valor do banco >>>
+    with SESSAO_LOCKS[session_id]:
+        if SESSAO_CACHE.get(session_id) is None:
+            print(f"Sessão {session_id}: Cache não encontrado. Recriando cache e contador em memória.")
+            SESSAO_CACHE[session_id] = deque(maxlen=JANELA_DE_ANALISE)
+            SESSAO_COUNTERS[session_id] = total_amostras_db
+    
+    try:
+        cursor = conn.cursor()
         patient_name_for_db = patient_name.replace(" ", "_").lower()
         cursor.execute("SELECT id FROM pacientes WHERE nome = ?", patient_name_for_db)
         paciente = cursor.fetchone()
@@ -1081,16 +1069,14 @@ def handle_resume_session(data):
                 'session_id': session_id,
                 'patient_name': patient_name
             }
-        
             socketio.emit('structure_changed')
             emit_state_update()
-
             print(f"Sessão {session_id} do paciente '{patient_name}' restaurada na lista de ativas.")
-
     except Exception as e:
         print(f"Erro ao restaurar sessão: {e}")
     finally:
-        conn.close()
+        if conn: conn.close()
+
         
 # --- Função para obter IP local ---
 def get_ip():
@@ -1107,25 +1093,23 @@ if __name__ == '__main__':
     port = PORT
     local_ip = get_ip()
 
-    # Inicia workers especializados
-    print("Iniciando workers especializados...")
+    # <<< CORREÇÃO CRÍTICA: Iniciar workers com o método seguro do SocketIO >>>
+    # Isto resolve o erro 'greenlet.error' e estabiliza o servidor.
+    print("Agendando workers especializados...")
     
-    # Workers para dados em tempo real (alta prioridade)
+    # Workers para dados em tempo real
     for i in range(NUM_REALTIME_WORKERS):
-        worker = Thread(target=database_realtime_writer_job, daemon=True, name=f"RealTimeWorker-{i+1}")
-        worker.start()
-        print(f"  - Worker de tempo real {i+1} iniciado")
+        socketio.start_background_task(target=database_realtime_writer_job)
+        print(f"  - Worker de tempo real {i+1} agendado")
 
-    # Workers para dados batch (baixa prioridade)
+    # Workers para dados batch
     for i in range(NUM_BATCH_WORKERS):
-        worker = Thread(target=database_batch_writer_job, daemon=True, name=f"BatchWorker-{i+1}")
-        worker.start()
-        print(f"  - Worker de batch {i+1} iniciado")
+        socketio.start_background_task(target=database_batch_writer_job)
+        print(f"  - Worker de batch {i+1} agendado")
 
     # Gerenciador de análises
-    print("Iniciando gerenciador de análises periódicas...")
-    analysis_manager_thread = Thread(target=gerenciador_de_analises_periodicas, daemon=True)
-    analysis_manager_thread.start()
+    #print("Agendando gerenciador de análises periódicas...")
+    #socketio.start_background_task(target=gerenciador_de_analises_periodicas)
     
     print("="*60)
     print(">>> SERVIDOR COM WORKERS ESPECIALIZADOS INICIADO <<<")
@@ -1134,4 +1118,5 @@ if __name__ == '__main__':
     print(f"Dashboard: http://{local_ip}:{port}")
     print("="*60)
     
-    socketio.run(app, host=host, port=port, debug=False)
+    # Usa socketio.run() que é a forma correta de iniciar o servidor com eventlet
+    socketio.run(app, host=host, port=port)
