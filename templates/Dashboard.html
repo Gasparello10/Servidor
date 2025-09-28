@@ -320,32 +320,36 @@
         }
         
         function selectActiveSession(patientId, sessionId) {
-            if (currentSessionId === sessionId) {
-                document.getElementById('history-view').style.display = 'none';
-                document.querySelector('.main-content > .session-selector').style.display = 'flex';
-                document.getElementById('analysis-content').style.display = 'block';
-                return;
-            }
-            console.log(`Forçando a seleção da sessão ativa: Paciente ${patientId}, Sessão ${sessionId}`);
-            document.getElementById('history-view').style.display = 'none';
-            document.querySelector('.main-content > .session-selector').style.display = 'flex';
             
-            const patientData = allPatientsData.find(p => p.id == patientId);
-            if (!patientData) {
-                console.error("Não foi possível encontrar dados para o paciente ID:", patientId);
-                return;
-            }
+            patientId = Number(patientId);
+            sessionId = Number(sessionId);
+            console.log(`Selecionando sessão ativa: ${sessionId} para paciente ${patientId}`);
+            
+            // 1. Unsibscribe de sessão anterior
             if (currentSessionId) {
                 socket.emit('unsubscribe_from_session', { id: currentSessionId });
             }
+
+            resetChartsForNewSession();
+
+            // 2. Atualiza o dropdown para refletir a seleção
+            document.getElementById('patient-select').value = patientId;
+            const patientData = allPatientsData.find(p => p.id == patientId);
+            if (patientData) {
+                populateSessionSelect(patientData.sessoes, sessionId);
+            }
             
-            const patientSelect = document.getElementById('patient-select');
-            patientSelect.value = patientId;
-            populateSessionSelect(patientData.sessoes, sessionId);
-            
+            // 3. Subscribe na nova sessão
             currentSessionId = sessionId;
-            loadInitialSessionData(currentSessionId);
             socket.emit('subscribe_to_session', { id: currentSessionId });
+            
+            // 4. Mostra conteúdo de análise
+            document.getElementById('analysis-content').style.display = 'block';
+            document.getElementById('history-view').style.display = 'none';
+            document.getElementById('battery-view').style.display = 'none';
+            document.querySelector('.main-content > .session-selector').style.display = 'flex';
+            
+            console.log(`Sessão ${sessionId} selecionada - aguardando dados...`);
         }
 
         function updateChartTitles() {
@@ -488,6 +492,11 @@
         function loadStructure(autoSelect = false, patientIdToSelect = null, sessionIdToSelect = null) {
             fetch('/api/structure').then(r => r.json()).then(data => {
                 allPatientsData = data;
+                        // *** ADICIONE ESTE LOG AQUI ***
+                console.log('=== DEBUG LOAD STRUCTURE ===');
+                console.log('Todos os pacientes carregados:', allPatientsData);
+                console.log('autoSelect:', autoSelect, 'patientIdToSelect:', patientIdToSelect, 'sessionIdToSelect:', sessionIdToSelect);
+                console.log('========================');
                 populatePatientSelect(patientIdToSelect || document.getElementById('patient-select').value);
                 populateHistoryPatientSelect(document.getElementById('history-patient-select').value);
                 const currentPatientId = document.getElementById('patient-select').value;
@@ -502,37 +511,6 @@
             });
         }
         
-        function loadInitialSessionData(sessionId) {
-            document.getElementById('analysis-content').style.display = 'block';
-            magnitudeChart.data.datasets[0].data = [];
-            rawChart.data.datasets[0].data = [];
-            rawChart.data.datasets[1].data = [];
-            rawChart.data.datasets[2].data = [];
-            magnitudeChart.update('none');
-            rawChart.update('none');
-            fetch(`/api/initial_session_data?id=${sessionId}`).then(response => response.json()).then(data => {
-                if (data.error) { console.error("Erro:", data.error); return; }
-                
-                updateMetricsDisplay(data.metrics);
-                
-                if (data.charts && data.charts.labels) {
-                    // <<< ALTERAÇÃO: Processa dados como objetos {x, y} para os gráficos de tempo real >>>
-                    const labels = data.charts.labels.slice(-MAX_CHART_POINTS);
-                    const magnitudeData = data.charts.sinal_filtrado.slice(-MAX_CHART_POINTS).map((d, i) => ({ x: labels[i], y: d }));
-                    const xData = data.charts.x.slice(-MAX_CHART_POINTS).map((d, i) => ({ x: labels[i], y: d }));
-                    const yData = data.charts.y.slice(-MAX_CHART_POINTS).map((d, i) => ({ x: labels[i], y: d }));
-                    const zData = data.charts.z.slice(-MAX_CHART_POINTS).map((d, i) => ({ x: labels[i], y: d }));
-
-                    magnitudeChart.data.datasets[0].data.push(...magnitudeData);
-                    rawChart.data.datasets[0].data.push(...xData);
-                    rawChart.data.datasets[1].data.push(...yData);
-                    rawChart.data.datasets[2].data.push(...zData);
-
-                    magnitudeChart.update('none');
-                    rawChart.update('none');
-                }
-            }).catch(error => console.error('Falha:', error));
-        }
         
         document.addEventListener('DOMContentLoaded', () => {
            const analysisContentHTML = `
@@ -610,26 +588,75 @@
                     document.getElementById('analysis-content').style.display = 'block';
                 }
             });
-
-            
             document.getElementById('patient-select').addEventListener('change', function() {
-                const patientData = allPatientsData.find(p => p.id == this.value);
-                populateSessionSelect(patientData ? patientData.sessoes : []);
-                document.getElementById('analysis-content').style.display = 'none';
+                const patientId = this.value;
+                const patientData = allPatientsData.find(p => p.id == patientId); // == para compatibilidade
+
+                console.log('=== DEBUG PATIENT SELECT ===');
+                console.log('Paciente selecionado:', patientId, 'tipo:', typeof patientId);
+                console.log('Dados do paciente encontrado:', patientData);
+                console.log('Sessões disponíveis:', patientData ? patientData.sessoes : []);
+                console.log('======================');
+
+                if (patientData && patientData.sessoes && patientData.sessoes.length > 0) {
+                    populateSessionSelect(patientData.sessoes);
+                    
+                    const sessionSelect = document.getElementById('session-select');
+                    
+                    setTimeout(() => {
+                        console.log('=== DEBUG SESSION SELECT ===');
+                        console.log('Número de opções no select:', sessionSelect.options.length);
+                        console.log('Opções disponíveis:');
+                        for (let i = 0; i < sessionSelect.options.length; i++) {
+                            console.log(`  [${i}] value: "${sessionSelect.options[i].value}" (tipo: ${typeof sessionSelect.options[i].value}), text: "${sessionSelect.options[i].text}"`);
+                        }
+                        
+                        // *** CORREÇÃO: Garantir que selecionamos uma sessão válida ***
+                        if (sessionSelect.options.length > 1) {
+                            // Encontra a primeira opção que não é a opção padrão
+                            for (let i = 0; i < sessionSelect.options.length; i++) {
+                                if (sessionSelect.options[i].value !== "") {
+                                    sessionSelect.selectedIndex = i;
+                                    const firstSessionId = sessionSelect.value;
+                                    console.log('Sessão selecionada automaticamente:', firstSessionId, 'tipo:', typeof firstSessionId);
+                                    
+                                    // *** CORREÇÃO: Chamar selectActiveSession com os valores do select ***
+                                    selectActiveSession(patientId, firstSessionId);
+                                    break;
+                                }
+                            }
+                        } else {
+                            console.log('Nenhuma sessão válida encontrada para seleção automática');
+                        }
+                    }, 10);
+                    
+                } else {
+                    console.log('Nenhuma sessão disponível para este paciente');
+                    populateSessionSelect([]);
+                    document.getElementById('analysis-content').style.display = 'none';
+                    if (currentSessionId) {
+                        socket.emit('unsubscribe_from_session', { id: currentSessionId });
+                        currentSessionId = null;
+                    }
+                }
             });
             
+
             document.getElementById('session-select').addEventListener('change', function() {
-                if (currentSessionId) {
-                    socket.emit('unsubscribe_from_session', { id: currentSessionId });
-                }
-                currentSessionId = this.value;
-                if (currentSessionId) {
-                    loadInitialSessionData(currentSessionId);
-                    socket.emit('subscribe_to_session', { id: currentSessionId });
+                const patientId = document.getElementById('patient-select').value;
+                const sessionId = this.value;
+                
+                if (sessionId) {
+                    selectActiveSession(patientId, sessionId);
                 } else {
                     document.getElementById('analysis-content').style.display = 'none';
+                    if (currentSessionId) {
+                        socket.emit('unsubscribe_from_session', { id: currentSessionId });
+                        currentSessionId = null;
+                    }
                 }
             });
+
 
             viewHistoryBtn.addEventListener('click', () => {
                 const currentPatientId = document.getElementById('patient-select').value;
@@ -658,6 +685,27 @@
             loadStructure();
         });
 
+
+        function resetChartsForNewSession() {
+            if (magnitudeChart) {
+                magnitudeChart.data.datasets[0].data = [];
+                magnitudeChart.update('none');
+            }
+            if (rawChart) {
+                rawChart.data.datasets.forEach(dataset => {
+                    dataset.data = [];
+                });
+                rawChart.update('none');
+            }
+            
+            // Reseta métricas
+            document.getElementById("rms-value").innerText = "0.0000";
+            document.getElementById("freq-value").innerText = "0.00 Hz";
+            document.getElementById("samples-value").innerText = "0";
+            document.getElementById("freq-x-value").innerText = "0.00 Hz";
+            document.getElementById("freq-y-value").innerText = "0.00 Hz";
+            document.getElementById("freq-z-value").innerText = "0.00 Hz";
+        }
         function updatePatientList(patientObjects) {
             const list = document.getElementById("patient-list");
             list.innerHTML = "";
@@ -721,8 +769,46 @@
         function showArchivedModal(){fetch("/api/archived_patients").then(t=>t.json()).then(t=>{const e=document.getElementById("archived-patient-list");e.innerHTML="",0===t.length?e.innerHTML="<li>Nenhum paciente arquivado.</li>":t.forEach(t=>{const n=document.createElement("li");n.innerHTML=`<span>${t.nome}</span> <button class="action-btn" onclick="restorePatient(${t.id})">Restaurar</button>`,e.appendChild(n)}),document.getElementById("archived-modal").style.display="block"})}
         function restorePatient(t){fetch("/api/restore_patient",{method:"POST",headers:{"Content-Type":"application/json"},body:JSON.stringify({patientId:t})}).then(()=>document.getElementById("archived-modal").style.display="none")}
         function populatePatientSelect(t){const e=document.getElementById("patient-select");e.innerHTML='<option value="">-- Selecione um Paciente --</option>',allPatientsData.forEach(t=>{const n=document.createElement("option");n.value=t.id,n.textContent=t.nome,e.appendChild(n)}),t&&allPatientsData.some(e=>e.id==t)&&(e.value=t)}
-        function populateSessionSelect(sessions, keepSelectedId){const sessionSelect=document.getElementById("session-select");if(sessionSelect.innerHTML='<option value="">-- Selecione uma Sessão --</option>',sessions&&0<sessions.length){sessions.forEach(session=>{const option=document.createElement("option");option.value=session.id;try{option.textContent=`Sessão de ${new Date(session.timestamp).toLocaleString("pt-BR")}`}catch(e){option.textContent=session.id}sessionSelect.appendChild(option)}),sessionSelect.disabled=!1,keepSelectedId&&sessions.some(s=>s.id==keepSelectedId)&&(sessionSelect.value=keepSelectedId)}else sessionSelect.disabled=!0}
-        
+        function populateSessionSelect(sessions, keepSelectedId) {
+            const sessionSelect = document.getElementById("session-select");
+            sessionSelect.innerHTML = '<option value="">-- Selecione uma Sessão --</option>';
+            if (keepSelectedId) {
+                keepSelectedId = Number(keepSelectedId);
+    }
+
+            // *** ADICIONE ESTES LOGS AQUI ***
+            console.log('=== DEBUG POPULATE SESSIONS ===');
+            console.log('Sessões recebidas para popular:', sessions);
+            console.log('keepSelectedId:', keepSelectedId);
+            
+            if (sessions && sessions.length > 0) {
+                sessions.forEach(session => {
+                    const option = document.createElement("option");
+                    option.value = session.id;
+                    try {
+                        option.textContent = `Sessão de ${new Date(session.timestamp).toLocaleString("pt-BR")}`;
+                    } catch(e) {
+                        option.textContent = `Sessão ${session.id}`;
+                    }
+                    sessionSelect.appendChild(option);
+                    console.log(`Adicionada opção: ${session.id} - ${option.textContent}`);
+                });
+                sessionSelect.disabled = false;
+                
+                if (keepSelectedId && sessions.some(s => s.id == keepSelectedId)) {
+                    sessionSelect.value = keepSelectedId;
+                    console.log('Mantida sessão selecionada:', keepSelectedId);
+                }
+            } else {
+                sessionSelect.disabled = true;
+                console.log('Select de sessões desabilitado - sem sessões');
+            }
+            
+            console.log('Total de opções no select:', sessionSelect.options.length);
+            console.log('============================');
+            
+            return Promise.resolve();
+        }
         function initializeCharts() {
             // <<< ALTERAÇÃO: Configura os gráficos de tempo real para usarem um eixo de tempo >>>
             const commonTimeAxisOptions = {
@@ -776,5 +862,6 @@
             });
         }
     </script>
+    
 </body>
 </html>
