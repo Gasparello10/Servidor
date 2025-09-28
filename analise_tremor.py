@@ -37,6 +37,14 @@ SESSOES_LOCK = Lock()
 last_timestamp_sent = {}
 DB_INSERT_QUEUE = Queue()
 
+# Filas separadas para diferentes tipos de carga
+DB_REALTIME_QUEUE = Queue()  # Dados em tempo real (alta prioridade)
+DB_BATCH_QUEUE = Queue()     # Dados históricos/batch (baixa prioridade)
+
+# Número de workers configuráveis
+NUM_REALTIME_WORKERS = 4     # Workers para dados em tempo real
+NUM_BATCH_WORKERS = 3        # Workers para dados batch
+
 # --- Configurações do servidor ---
 HOST = '0.0.0.0'
 PORT = 5000
@@ -157,50 +165,23 @@ def processar_lote_grande(payload, get_db_connection_func):
         import traceback
         traceback.print_exc()
 
-def database_writer_job():
+def database_realtime_writer_job():
     """
-    Esta função roda em uma thread separada. Ela consome itens da
-    fila DB_INSERT_QUEUE e os insere no banco em lotes.
-    Agora ela também processa grandes lotes de dados offline de forma assíncrona.
+    Worker especializado para dados em tempo real.
+    Prioridade: baixa latência, processamento rápido.
     """
     leituras_batch = []
     analises_batch = []
     bateria_batch = []
     
+    print(">>> Worker de tempo real iniciado <<<")
+    
     while True:
         try:
-            # Pega o primeiro item, bloqueando a thread se a fila estiver vazia
-            item_type, data = DB_INSERT_QUEUE.get()
-            
-            # <<< MUDANÇA PRINCIPAL: ROTA PARA PROCESSAMENTO DE LOTES GRANDES >>>
-            # Se o item for um lote grande, processa-o imediatamente e pula o resto do loop.
-            if item_type == 'batch_leitura':
-                # Passamos a função get_db_connection para a lógica de processamento
-                processar_lote_grande(data, get_db_connection)
-                continue # Volta ao início para buscar o próximo item da fila
-
-            # <<< LÓGICA ORIGINAL PARA DADOS EM TEMPO REAL >>>
-            # Se não for um lote grande, segue o fluxo normal de agrupar itens pequenos.
-            
-            # Agrupa os itens por tipo
-            if item_type == 'leitura':
-                leituras_batch.append(data)
-            elif item_type == 'analise':
-                analises_batch.append(data)
-            elif item_type == 'bateria':
-                bateria_batch.append(data)
-
-            # Processa em lotes: Se a fila tiver mais itens, pega mais alguns antes de salvar
-            # Isso otimiza o envio de dados em tempo real que chegam muito rápido
-            while not DB_INSERT_QUEUE.empty() and (len(leituras_batch) + len(analises_batch) + len(bateria_batch)) < 500:
-                # Usamos get_nowait() para não bloquear se a fila esvaziar durante o loop
-                item_type, data = DB_INSERT_QUEUE.get_nowait()
+            # Processa dados em tempo real com alta prioridade
+            while not DB_REALTIME_QUEUE.empty():
+                item_type, data = DB_REALTIME_QUEUE.get_nowait()
                 
-                # <<< MUDANÇA: Impede que um lote grande seja agrupado com dados em tempo real >>>
-                if item_type == 'batch_leitura':
-                    processar_lote_grande(data, get_db_connection)
-                    continue # Pula para a próxima iteração do while interno
-
                 if item_type == 'leitura':
                     leituras_batch.append(data)
                 elif item_type == 'analise':
@@ -208,58 +189,79 @@ def database_writer_job():
                 elif item_type == 'bateria':
                     bateria_batch.append(data)
 
-            # Se não houver nada para inserir após o loop, simplesmente continue
-            if not any([leituras_batch, analises_batch, bateria_batch]):
-                continue
+            # Insere lotes menores para manter baixa latência
+            batch_size = len(leituras_batch) + len(analises_batch) + len(bateria_batch)
+            if batch_size > 0 and (batch_size >= 50 or DB_REALTIME_QUEUE.empty()):
+                conn = get_db_connection()
+                if not conn:
+                    print("Worker RealTime: Falha na conexão. Limpando batch...")
+                    leituras_batch.clear(); analises_batch.clear(); bateria_batch.clear()
+                    time.sleep(1)
+                    continue
 
-            conn = get_db_connection()
-            if not conn:
-                print("Worker de BD: Falha na conexão. (Itens atuais podem ser perdidos)")
-                # Limpa os lotes para evitar tentar reinserir dados que podem ter causado o problema
-                leituras_batch.clear(); analises_batch.clear(); bateria_batch.clear()
-                time.sleep(5)
-                continue
+                try:
+                    cursor = conn.cursor()
+                    
+                    if leituras_batch:
+                        sql_leituras = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
+                        cursor.executemany(sql_leituras, leituras_batch)
+                        print(f"RealTime Worker: Inseridas {len(leituras_batch)} leituras")
+                        leituras_batch.clear()
 
-            cursor = conn.cursor()
+                    if analises_batch:
+                        sql_analises = """
+                            INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, 
+                                   freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms) 
+                            VALUES (?, GETUTCDATE(), ?, ?, ?, ?, ?, ?)
+                        """
+                        cursor.executemany(sql_analises, analises_batch)
+                        print(f"RealTime Worker: Inseridas {len(analises_batch)} análises")
+                        analises_batch.clear()
+
+                    if bateria_batch:
+                        sql_bateria = "INSERT INTO leituras_bateria (sessao_id, timestamp_leitura, nivel_bateria) VALUES (?, ?, ?)"
+                        cursor.executemany(sql_bateria, bateria_batch)
+                        print(f"RealTime Worker: Inseridas {len(bateria_batch)} leituras de bateria")
+                        bateria_batch.clear()
+
+                    conn.commit()
+                    
+                except pyodbc.Error as e:
+                    print(f"RealTime Worker ERRO: {e}")
+                    conn.rollback()
+                    # Em caso de erro, limpa os batches para evitar loops
+                    leituras_batch.clear(); analises_batch.clear(); bateria_batch.clear()
+                finally:
+                    conn.close()
+
+            # Pequeno sleep para não consumir CPU excessivamente
+            time.sleep(0.1)
             
-            try:
-                # Insere leituras se houver
-                if leituras_batch:
-                    sql_leituras = "INSERT INTO leituras (sessao_id, timestamp_ms, x, y, z) VALUES (?, ?, ?, ?, ?)"
-                    cursor.executemany(sql_leituras, leituras_batch)
-                    leituras_batch.clear()
-
-                # Insere análises se houver
-                if analises_batch:
-                    sql_analises = """
-                        INSERT INTO analises_janela (
-                            sessao_id, timestamp_janela, intensidade_rms, freq_pico, 
-                            freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms
-                        ) VALUES (?, GETUTCDATE(), ?, ?, ?, ?, ?, ?);
-                    """
-                    cursor.executemany(sql_analises, analises_batch)
-                    analises_batch.clear()
-
-                # Insere leituras de bateria se houver
-                if bateria_batch:
-                    sql_bateria = "INSERT INTO leituras_bateria (sessao_id, timestamp_leitura, nivel_bateria) VALUES (?, ?, ?)"
-                    cursor.executemany(sql_bateria, bateria_batch)
-                    bateria_batch.clear()
-
-                conn.commit()
-            except pyodbc.Error as e:
-                print(f"BD Worker ERRO: {e}")
-                conn.rollback()
-                # Limpa os lotes em caso de erro para não tentar reinserir os mesmos dados problemáticos
-                leituras_batch.clear(); analises_batch.clear(); bateria_batch.clear()
-            finally:
-                conn.close()
-
         except Exception as e:
-            print(f"Erro no loop principal do BD Worker: {e}")
-            # Limpa os lotes para garantir um estado limpo na próxima iteração
+            print(f"Erro crítico no RealTime Worker: {e}")
             leituras_batch.clear(); analises_batch.clear(); bateria_batch.clear()
-            time.sleep(2)
+            time.sleep(1)
+
+def database_batch_writer_job():
+    """
+    Worker especializado para dados batch/históricos.
+    Prioridade: processamento eficiente de grandes volumes.
+    """
+    print(">>> Worker de batch iniciado <<<")
+    
+    while True:
+        try:
+            # Processa um item por vez da fila de batch
+            if not DB_BATCH_QUEUE.empty():
+                payload = DB_BATCH_QUEUE.get()
+                processar_lote_grande(payload, get_db_connection)
+            else:
+                # Sleep maior quando não há trabalho
+                time.sleep(2)
+                
+        except Exception as e:
+            print(f"Erro crítico no Batch Worker: {e}")
+            time.sleep(5)
             
 # --- Funções de Análise ---
 def filtrar_sinal_passa_faixa(sinal, freq_corte_baixa, freq_corte_alta, taxa_amostragem):
@@ -405,26 +407,18 @@ def dashboard():
 
 @app.route('/data/batch-upload', methods=['POST'])
 def receber_dados_batch():
-    """
-    Endpoint para receber dados históricos/offline e inseri-los no banco.
-    Ideal para quando o dispositivo ficou offline e precisa enviar dados acumulados.
-    """
+    """Endpoint para dados históricos - usa fila de baixa prioridade"""
     try:
         payload = request.get_json()
         if not payload or 'sessao_id' not in payload or 'data' not in payload:
-            return jsonify({"status": "erro", "message": "Payload inválido. Campos 'sessao_id' e 'data' são obrigatórios."}), 400
+            return jsonify({"status": "erro", "message": "Payload inválido"}), 400
 
         sessao_id = int(payload['sessao_id'])
         dados_leituras = payload['data']
         
-        # Validações básicas
-        if not isinstance(dados_leituras, list):
-            return jsonify({"status": "erro", "message": "O campo 'data' deve ser uma lista de leituras."}), 400
-        
         if not dados_leituras:
             return jsonify({"status": "aceito", "message": "Nenhum dado para processar"}), 202
 
-        # Filtra leituras válidas
         leituras_validas = [l for l in dados_leituras if all(k in l for k in ['timestamp', 'x', 'y', 'z'])]
         
         if not leituras_validas:
@@ -432,14 +426,13 @@ def receber_dados_batch():
 
         print(f"Recebido lote histórico para sessão {sessao_id}: {len(leituras_validas)} leituras válidas")
 
-        # Enfileira o lote para processamento assíncrono
-        DB_INSERT_QUEUE.put(('batch_leitura', payload))
+        # ENFILEIRA NA FILA DE BATCH (BAIXA PRIORIDADE)
+        DB_BATCH_QUEUE.put(payload)
         
-        # Marca a sessão para reanálise histórica
         with SESSOES_LOCK:
             SESSOES_PARA_REANALISAR.add(sessao_id)
         
-        print(f"Sessão {sessao_id}: Lote de {len(leituras_validas)} leituras enfileirado. Sessão marcada para reanálise histórica.")
+        print(f"Sessão {sessao_id}: Lote enfileirado para processamento batch.")
         
         return jsonify({
             "status": "aceito", 
@@ -447,16 +440,17 @@ def receber_dados_batch():
             "leituras_validas": len(leituras_validas)
         }), 202
 
-    except ValueError as e:
-        return jsonify({"status": "erro", "message": f"ID da sessão inválido: {str(e)}"}), 400
     except Exception as e:
         import traceback
         print(f"ERRO CRÍTICO em /data/batch-upload: {e}")
         traceback.print_exc()
         return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
 
+
+
 @app.route('/data', methods=['POST'])
 def receber_dados():
+    """Endpoint para dados em tempo real - usa fila de alta prioridade"""
     try:
         payload = request.get_json()
         if not payload or 'sessao_id' not in payload or 'data' not in payload:
@@ -472,28 +466,21 @@ def receber_dados():
         if not leituras_validas:
             return jsonify({"status": "aceito", "message": "Nenhum dado válido"}), 202
 
-        # --- 1. COLOCA OS DADOS BRUTOS NA FILA DE INSERÇÃO ---
+        # ENFILEIRA NA FILA DE TEMPO REAL (ALTA PRIORIDADE)
         for l in leituras_validas:
             params = (sessao_id, int(l['timestamp']), l.get('x'), l.get('y'), l.get('z'))
-            DB_INSERT_QUEUE.put(('leitura', params))
+            DB_REALTIME_QUEUE.put(('leitura', params))
 
-        # --- 2. ATUALIZA O CACHE E O CONTADOR DE FORMA SEGURA ---
+        # Resto da lógica (cache, análise) permanece igual
         with SESSAO_LOCKS[sessao_id]:
-            # <<< MUDANÇA: Incrementa o contador de amostras da sessão >>>
             if sessao_id in SESSAO_COUNTERS:
                 SESSAO_COUNTERS[sessao_id] += len(leituras_validas)
             
-            # <<< MUDANÇA: Lógica de atualização do cache mais eficiente >>>
             cache_deque = SESSAO_CACHE.get(sessao_id)
             if cache_deque is not None:
-                cache_deque.extend(leituras_validas) # Adiciona novos itens, os antigos são removidos automaticamente
+                cache_deque.extend(leituras_validas)
         
-        # --- 3. DISPARA A ANÁLISE EM BACKGROUND ---
-        socketio.start_background_task(
-            target=process_and_push_update, 
-            session_id=sessao_id, 
-            novas_leituras=leituras_validas
-        )
+        socketio.start_background_task(process_and_push_update, session_id=sessao_id, novas_leituras=leituras_validas)
         
         return jsonify({"status": "aceito"}), 202
 
@@ -502,7 +489,7 @@ def receber_dados():
         print(f"ERRO INESPERADO em /data: {e}")
         traceback.print_exc()
         return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
-        
+            
 # <<< NOVA FUNÇÃO PARA ANÁLISE HISTÓRICA >>>
 def analisar_dados_historicos(session_id):
     """
@@ -790,7 +777,16 @@ def get_historical_data():
 
 
 
-        
+@app.route('/api/queue-status')
+def queue_status():
+    """Retorna status das filas para monitoramento"""
+    return jsonify({
+        'realtime_queue_size': DB_REALTIME_QUEUE.qsize(),
+        'batch_queue_size': DB_BATCH_QUEUE.qsize(),
+        'active_sessions': len(active_sessions),
+        'connected_clients': len(connected_clients)
+    })
+
 @app.route('/api/initial_session_data')
 def initial_session_data():
     session_id = request.args.get('id')
@@ -1103,30 +1099,39 @@ def get_ip():
     except Exception: IP = '127.0.0.1'
     finally: s.close()
     return IP
-    # --- Execução do Servidor ---
+
+
+
 if __name__ == '__main__':
     host = HOST
     port = PORT
     local_ip = get_ip()
 
-    # Inicia os workers de banco de dados
-    print("Iniciando workers de banco de dados...")
-    num_db_workers = 2 
-    for i in range(num_db_workers):
-        worker = Thread(target=database_writer_job, daemon=True)
+    # Inicia workers especializados
+    print("Iniciando workers especializados...")
+    
+    # Workers para dados em tempo real (alta prioridade)
+    for i in range(NUM_REALTIME_WORKERS):
+        worker = Thread(target=database_realtime_writer_job, daemon=True, name=f"RealTimeWorker-{i+1}")
         worker.start()
-        print(f"  - Worker {i+1} iniciado.")
+        print(f"  - Worker de tempo real {i+1} iniciado")
 
-    # Inicia a thread do gerenciador de análises
+    # Workers para dados batch (baixa prioridade)
+    for i in range(NUM_BATCH_WORKERS):
+        worker = Thread(target=database_batch_writer_job, daemon=True, name=f"BatchWorker-{i+1}")
+        worker.start()
+        print(f"  - Worker de batch {i+1} iniciado")
+
+    # Gerenciador de análises
     print("Iniciando gerenciador de análises periódicas...")
     analysis_manager_thread = Thread(target=gerenciador_de_analises_periodicas, daemon=True)
     analysis_manager_thread.start()
     
     print("="*60)
-    print(">>> SERVIDOR DE CONTROLE E ANÁLISE INICIADO <<<")
-    print(f"Dashboard disponível em: http://{local_ip}:{port}")
-    print(f"Celulares devem se conectar a: ws://{local_ip}:{port}")
+    print(">>> SERVIDOR COM WORKERS ESPECIALIZADOS INICIADO <<<")
+    print(f"Workers Realtime: {NUM_REALTIME_WORKERS}")
+    print(f"Workers Batch: {NUM_BATCH_WORKERS}")
+    print(f"Dashboard: http://{local_ip}:{port}")
     print("="*60)
     
-    # Use socketio.run() em vez de eventlet.wsgi.server para melhor compatibilidade
     socketio.run(app, host=host, port=port, debug=False)
