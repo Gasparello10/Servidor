@@ -457,12 +457,14 @@ def receber_dados():
         traceback.print_exc()
         return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
             
-# <<< NOVA FUNÇÃO PARA ANÁLISE HISTÓRICA >>>
+
+# No seu ficheiro analise_tremor.py, substitua a sua função
+# `analisar_dados_historicos` por esta versão otimizada.
+
 def analisar_dados_historicos(session_id):
     """
-    Executa a análise de frequência e RMS sobre TODOS os dados de uma sessão,
-    lendo da tabela 'leituras' e salvando em 'analises_janela'.
-    Esta função é pesada e deve ser executada em background, idealmente no final de uma sessão.
+    Executa a análise histórica completa de uma sessão.
+    Esta versão é otimizada para não bloquear o servidor durante o processamento.
     """
     print(f"Iniciando análise histórica completa para a sessão {session_id}...")
     
@@ -472,31 +474,27 @@ def analisar_dados_historicos(session_id):
         return
 
     try:
-        # 1. Carrega todos os dados brutos da sessão em um DataFrame do Pandas
         sql_select = "SELECT timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms ASC"
         df = pd.read_sql(sql_select, conn, params=[session_id])
 
         if len(df) < JANELA_DE_ANALISE:
-            print(f"[ANÁLISE HISTÓRICA] Sessão {session_id}: Dados insuficientes ({len(df)} pontos) para análise de janela. Abortando.")
+            print(f"[ANÁLISE HISTÓRICA] Sessão {session_id}: Dados insuficientes ({len(df)} pontos) para análise. Abortando.")
             return
 
-        # 2. Prepara as colunas para análise
         x_centered = df['x'] - df['x'].mean()
         y_centered = df['y'] - df['y'].mean()
         z_centered = df['z'] - df['z'].mean()
         df['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
 
         analises_para_inserir = []
-        
-        # 3. Itera sobre os dados usando uma janela deslizante
-        # O passo (step) pode ser ajustado. Um passo menor gera mais pontos de análise.
-        # Um passo de TAXA_AMOSTRAGEM (25) significa que geramos uma análise por segundo.
         passo_da_janela = TAXA_AMOSTRAGEM 
         
+        # Otimização: processa em blocos para chamar sleep com menos frequência
+        process_counter = 0
+
         for i in range(0, len(df) - JANELA_DE_ANALISE, passo_da_janela):
             df_janela = df.iloc[i : i + JANELA_DE_ANALISE]
 
-            # Reutiliza as suas funções de análise existentes
             sinal_mag = df_janela['magnitude'].to_numpy()
             sinal_x = (df_janela['x'] - df_janela['x'].mean()).to_numpy()
             sinal_y = (df_janela['y'] - df_janela['y'].mean()).to_numpy()
@@ -515,22 +513,22 @@ def analisar_dados_historicos(session_id):
             
             ultimo_timestamp_sensor = int(df_janela['timestamp_ms'].iloc[-1])
             
-            # Prepara os dados para inserção em lote
             analise_data = (
-                session_id, 
-                intensidade_rms, 
-                freq_pico, 
-                freq_pico_x, 
-                freq_pico_y, 
-                freq_pico_z, 
+                session_id, intensidade_rms, freq_pico, 
+                freq_pico_x, freq_pico_y, freq_pico_z, 
                 ultimo_timestamp_sensor
             )
             analises_para_inserir.append(analise_data)
 
-        # 4. Insere todos os resultados da análise no banco de uma só vez
+            # <<< OTIMIZAÇÃO DE DESEMPENHO >>>
+            # A cada 100 cálculos, fazemos uma pequena pausa para permitir que
+            # outras tarefas do servidor (como receber novos dados) sejam executadas.
+            process_counter += 1
+            if process_counter % 100 == 0:
+                eventlet.sleep(0) # Libera o controle para o event loop
+
         if analises_para_inserir:
             cursor = conn.cursor()
-            # Primeiro, vamos deletar análises antigas para evitar duplicatas se reprocessarmos
             cursor.execute("DELETE FROM analises_janela WHERE sessao_id = ?", session_id)
             
             sql_insert_analise = """
@@ -547,10 +545,9 @@ def analisar_dados_historicos(session_id):
 
     except Exception as e:
         print(f"Erro CRÍTICO durante a análise histórica da sessão {session_id}: {e}")
-        import traceback
-        traceback.print_exc()
     finally:
-        conn.close()
+        if conn:
+            conn.close()
 
 
 @app.route('/api/battery_history')
@@ -757,46 +754,32 @@ def queue_status():
 @app.route('/api/initial_session_data')
 def initial_session_data():
     session_id = request.args.get('id')
-    if not session_id: return jsonify({"error": "ID da sessão não especificado"}), 400
+    if not session_id:
+        return jsonify({"error": "ID da sessão não especificado"}), 400
 
     conn = get_db_connection()
-    if not conn: return jsonify({"error": "Falha na conexão com o banco"}), 500
+    if not conn:
+        return jsonify({"error": "Falha na conexão com o banco"}), 500
     cursor = conn.cursor()
 
     try:
-        sql_completo = "SELECT timestamp_ms, x, y, z FROM leituras WHERE sessao_id = ? ORDER BY timestamp_ms ASC"
-        cursor.execute(sql_completo, int(session_id))
-        rows = cursor.fetchall()
-        
-        if not rows:
-            cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", int(session_id))
-            total_amostras = cursor.fetchone()[0]
-            return jsonify({
-                "metrics": {"total_amostras": total_amostras, "freq_dominante": 0, "intensidade_rms": 0}, 
-                "charts": {"labels": [], "x": [], "y": [], "z": [], "sinal_filtrado": []}
-            })
+        # Apenas conta quantas leituras já existem
+        cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", int(session_id))
+        total_amostras = cursor.fetchone()[0]
 
-        df = pd.DataFrame.from_records(rows, columns=[desc[0] for desc in cursor.description])
-        total_amostras = len(df)
-        
-        labels_reais_ms = df["timestamp_ms"].tolist()
-        
-        x_centered = df['x'] - df['x'].mean()
-        y_centered = df['y'] - df['y'].mean()
-        z_centered = df['z'] - df['z'].mean()
-        df['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
-        sinal_analise_filtrado = filtrar_sinal_passa_faixa(df['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
-        intensidade_rms = np.sqrt(np.mean(sinal_analise_filtrado**2)) if sinal_analise_filtrado.any() else 0.0
-        freq_pico = analisar_frequencia_com_welch(sinal_analise_filtrado, TAXA_AMOSTRAGEM) if sinal_analise_filtrado.any() else 0.0
-    
+        # Retorna apenas o mínimo necessário
         return jsonify({
-            "metrics": {"freq_dominante": freq_pico, "intensidade_rms": intensidade_rms, "total_amostras": total_amostras},
+            "metrics": {
+                "freq_dominante": None,   # não calculamos aqui
+                "intensidade_rms": None,  # não calculamos aqui
+                "total_amostras": total_amostras
+            },
             "charts": {
-                "labels": labels_reais_ms,
-                "x": x_centered.tolist(),  
-                "y": y_centered.tolist(),
-                "z": z_centered.tolist(),
-                "sinal_filtrado": sinal_analise_filtrado.tolist()
+                "labels": [],             # gráfico começa vazio
+                "x": [],
+                "y": [],
+                "z": [],
+                "sinal_filtrado": []
             }
         })
     except Exception as e:
@@ -1112,8 +1095,8 @@ if __name__ == '__main__':
         print(f"  - Worker de batch {i+1} agendado")
 
     # Gerenciador de análises
-    #print("Agendando gerenciador de análises periódicas...")
-    #socketio.start_background_task(target=gerenciador_de_analises_periodicas)
+    print("Agendando gerenciador de análises periódicas...")
+    socketio.start_background_task(target=gerenciador_de_analises_periodicas)
     
     print("="*60)
     print(">>> SERVIDOR COM WORKERS ESPECIALIZADOS INICIADO <<<")
