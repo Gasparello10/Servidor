@@ -193,55 +193,40 @@
         });
         socket.on('session_update', function(data) {
     
-            // Confirma no console do NAVEGADOR que os dados estão a chegar
-            console.log("Recebido 'session_update':", data);
-
             // Apenas processa se a atualização for para a sessão que estamos a ver
-            // (Presume-se que você tenha uma variável 'currentSessionId')
             if (data.sessionId !== currentSessionId) {
                 return;
             }
 
-            // --- 1. ATUALIZAR AS MÉTRICAS (os números) ---
-            // Esta parte já deve estar a funcionar corretamente.
+            // --- 1. ATUALIZAR AS MÉTRICAS ---
             updateMetricsDisplay(data.metrics);
             
-            // --- 2. ATUALIZAR OS GRÁFICOS (a parte corrigida) ---
+            // --- 2. ATUALIZAR OS GRÁFICOS ---
             const chartData = data.charts;
 
             // Verifica se os objetos dos gráficos e os dados existem
             if (magnitudeChart && rawChart && chartData && chartData.labels) {
                 
-                // <<< MUDANÇA: Define o número máximo de pontos a exibir e corta os arrays >>>
-                const MAX_POINTS_TO_SHOW = 200;
+                // <<< OTIMIZAÇÃO: O corte de dados foi removido daqui >>>
+                // O JavaScript agora recebe os arrays já com 200 pontos.
 
-                // Pega apenas os últimos N pontos dos arrays recebidos do servidor
-                const labels = chartData.labels.slice(-MAX_POINTS_TO_SHOW);
-                const sinalFiltrado = chartData.sinal_filtrado.slice(-MAX_POINTS_TO_SHOW);
-                const xValues = chartData.x.slice(-MAX_POINTS_TO_SHOW);
-                const yValues = chartData.y.slice(-MAX_POINTS_TO_SHOW);
-                const zValues = chartData.z.slice(-MAX_POINTS_TO_SHOW);
+                // Transforma os dados recebidos no formato {x, y}
+                const magnitudeData = chartData.labels.map((label, index) => ({ x: label, y: chartData.sinal_filtrado[index] }));
+                const xData = chartData.labels.map((label, index) => ({ x: label, y: chartData.x[index] }));
+                const yData = chartData.labels.map((label, index) => ({ x: label, y: chartData.y[index] }));
+                const zData = chartData.labels.map((label, index) => ({ x: label, y: chartData.z[index] }));
 
-                // Transforma os dados cortados no formato {x, y} que o Chart.js espera
-                const magnitudeData = labels.map((label, index) => ({ x: label, y: sinalFiltrado[index] }));
-                const xData = labels.map((label, index) => ({ x: label, y: xValues[index] }));
-                const yData = labels.map((label, index) => ({ x: label, y: yValues[index] }));
-                const zData = labels.map((label, index) => ({ x: label, y: zValues[index] }));
-
-                // Substitui os dados do gráfico pelos novos dados (agora com 200 pontos)
+                // Substitui os dados do gráfico pelos novos dados
                 magnitudeChart.data.datasets[0].data = magnitudeData;
                 rawChart.data.datasets[0].data = xData;
                 rawChart.data.datasets[1].data = yData;
                 rawChart.data.datasets[2].data = zData;
                 
-                // **A LINHA MAIS IMPORTANTE!**
-                // Manda o Chart.js redesenhar os gráficos com os novos dados.
-                // O parâmetro 'none' faz uma atualização sem animação, que é ideal para tempo real.
+                // Manda o Chart.js redesenhar os gráficos
                 magnitudeChart.update('none');
                 rawChart.update('none');
             }
         });
-
 
         function updateMetricsDisplay(metrics) {
             if (!metrics) return;

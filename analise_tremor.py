@@ -281,8 +281,8 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 
 def process_and_push_update(session_id, novas_leituras):
     """
-    Processa dados usando o CACHE em memória, envia uma atualização COMPLETA
-    para o dashboard e enfileira o resultado da análise para o banco.
+    Processa dados usando o CACHE em memória, envia uma atualização OTIMIZADA
+    para o dashboard (apenas 200 pontos) e enfileira a análise para o banco.
     """
     janela_completa_copia = []
     with SESSAO_LOCKS[session_id]:
@@ -294,6 +294,7 @@ def process_and_push_update(session_id, novas_leituras):
 
     try:
         df_analysis = pd.DataFrame(janela_completa_copia)
+        # <<< A REMOÇÃO DA MÉDIA ACONTECE AQUI >>>
         x_centered = df_analysis['x'] - df_analysis['x'].mean()
         y_centered = df_analysis['y'] - df_analysis['y'].mean()
         z_centered = df_analysis['z'] - df_analysis['z'].mean()
@@ -309,31 +310,36 @@ def process_and_push_update(session_id, novas_leituras):
         freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
         freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
         freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
-        
+
         total_amostras_reais = SESSAO_COUNTERS.get(session_id, len(df_analysis))
         
+        MAX_POINTS_TO_SHOW = 200
+        
+        labels_cortados = df_analysis['timestamp'].tolist()[-MAX_POINTS_TO_SHOW:]
+        x_cortado = x_centered.tolist()[-MAX_POINTS_TO_SHOW:]
+        y_cortado = y_centered.tolist()[-MAX_POINTS_TO_SHOW:]
+        z_cortado = z_centered.tolist()[-MAX_POINTS_TO_SHOW:]
+        sinal_filtrado_cortado = sinal_magnitude_filtrado.tolist()[-MAX_POINTS_TO_SHOW:]
+
         room_name = f'session_room_{session_id}'
         payload = {
             "sessionId": session_id,
             "metrics": {
-                "total_amostras": total_amostras_reais, "intensidade_rms": intensidade_rms, "freq_dominante": freq_pico,
-                "freq_pico_x": freq_pico_x, "freq_pico_y": freq_pico_y, "freq_pico_z": freq_pico_z
+                "total_amostras": total_amostras_reais, 
+                "intensidade_rms": intensidade_rms, 
+                "freq_dominante": freq_pico,
+                "freq_pico_x": freq_pico_x,
+                "freq_pico_y": freq_pico_y,
+                "freq_pico_z": freq_pico_z
             },
             "charts": {
-                "labels": df_analysis['timestamp'].tolist(),
-                "x": x_centered.tolist(), "y": y_centered.tolist(), "z": z_centered.tolist(),
-                "sinal_filtrado": sinal_magnitude_filtrado.tolist()
+                "labels": labels_cortados,
+                "x": x_cortado, 
+                "y": y_cortado, 
+                "z": z_cortado,
+                "sinal_filtrado": sinal_filtrado_cortado
             }
         }
-
-        # <<< PRINT DE DEPURAÇÃO ADICIONADO AQUI >>>
-        print(f"[DEPURAÇÃO GRÁFICO] Enviando para sala '{room_name}': "
-              f"Labels: {len(payload['charts']['labels'])}, "
-              f"X: {len(payload['charts']['x'])}, "
-              f"Y: {len(payload['charts']['y'])}, "
-              f"Z: {len(payload['charts']['z'])}, "
-              f"Filtrado: {len(payload['charts']['sinal_filtrado'])}")
-
         socketio.emit('session_update', payload, room=room_name)
         
         ultimo_timestamp_sensor = int(df_analysis['timestamp'].iloc[-1])
@@ -342,8 +348,6 @@ def process_and_push_update(session_id, novas_leituras):
 
     except Exception as e:
         print(f"Erro CRÍTICO em process_and_push_update: {e}")
-        import traceback
-        traceback.print_exc()
 
 
 
