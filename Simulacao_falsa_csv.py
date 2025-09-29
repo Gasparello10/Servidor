@@ -29,7 +29,7 @@ tempo_sinal_seg = np.arange(AMOSTRAS_SINAL) / TAXA_AMOSTRAGEM_HZ
 
 # Gera todos os valores do sinal de uma vez (vetorização)
 sinal_puro_x = AMPLITUDE_SINAL * np.sin(2 * np.pi * FREQUENCIA_SINAL_HZ * tempo_sinal_seg)
-sinal_puro_y = AMPLITUDE_SINAL * np.sin(2 * np.pi * 3 * tempo_sinal_seg)
+sinal_puro_y = AMPLITUDE_SINAL * np.sin(2 * np.pi * 6 * tempo_sinal_seg)
 sinal_puro_z = AMPLITUDE_SINAL * np.sin(2 * np.pi * 5 * tempo_sinal_seg)
 
 # Cria os arrays de "silêncio" (zeros)
