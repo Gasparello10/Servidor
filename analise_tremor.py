@@ -43,7 +43,7 @@ DB_BATCH_QUEUE = Queue()     # Dados históricos/batch (baixa prioridade)
 
 # Número de workers configuráveis
 NUM_REALTIME_WORKERS = 4     # Workers para dados em tempo real
-NUM_BATCH_WORKERS = 3        # Workers para dados batch
+NUM_BATCH_WORKERS = 5        # Workers para dados batch
 
 # --- Configurações do servidor ---
 HOST = '0.0.0.0'
