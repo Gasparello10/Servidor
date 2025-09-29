@@ -3,14 +3,14 @@ import numpy as np
 import time
 
 # --- Parâmetros da Simulação ---
-DURACAO_MINUTOS = 1
-TAXA_AMOSTRAGEM_HZ = 50
-FREQUENCIA_SINAL_HZ = 1.0
+DURACAO_MINUTOS = 10
+TAXA_AMOSTRAGEM_HZ = 25
+FREQUENCIA_SINAL_HZ = 5.0
 AMPLITUDE_SINAL = 15.0
 GRAVIDADE = 9.8
 NIVEL_RUIDO = 0
 ATRASO_INICIAL_SEGUNDOS = 5
-NOME_ARQUIVO = 'simulacao_20min_6hz.csv'
+NOME_ARQUIVO = 'simulacao_10min_5hz.csv'
 # ---------------------------------------------------------
 
 print(f"Gerando dados para o arquivo '{NOME_ARQUIVO}'...")

@@ -17,6 +17,7 @@ from collections import deque
 from threading import Lock, Thread # <<< ALTERADO >>> Adicionado Thread
 from queue import Queue # <<< NOVA IMPLEMENTAÇÃO >>> Fila para inserções no BD
 import pytz
+import traceback
 
 
 # ==========================
@@ -280,40 +281,86 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
 
 def process_and_push_update(session_id, novas_leituras):
     """
-    Processa dados usando o CACHE em memória, envia uma atualização OTIMIZADA
-    para o dashboard (apenas 200 pontos) e enfileira a análise para o banco.
+    Processa dados usando o CACHE em memória, com melhor tratamento de casos borda
+    e diagnóstico para identificar problemas de dados zerados.
     """
     janela_completa_copia = []
-    with SESSAO_LOCKS[session_id]:
-        if SESSAO_CACHE.get(session_id):
-            janela_completa_copia = list(SESSAO_CACHE[session_id])
+    total_amostras_cache = 0
     
-    if len(janela_completa_copia) < 34: 
+    with SESSAO_LOCKS[session_id]:
+        cache_deque = SESSAO_CACHE.get(session_id)
+        if cache_deque:
+            janela_completa_copia = list(cache_deque)
+            total_amostras_cache = len(janela_completa_copia)
+    
+    # DEBUG: Log do estado do cache
+    print(f"[DEBUG] Sessão {session_id}: Cache tem {total_amostras_cache} amostras, {len(novas_leituras)} novas leituras")
+    
+    # Se não há dados suficientes, espera acumular mais
+    if total_amostras_cache < 50:  # Aumentei o mínimo para 50 amostras
+        print(f"[DEBUG] Sessão {session_id}: Cache insuficiente ({total_amostras_cache} amostras). Aguardando mais dados.")
         return
 
     try:
         df_analysis = pd.DataFrame(janela_completa_copia)
         
+        # Verifica se há dados válidos
+        if df_analysis.empty:
+            print(f"[DEBUG] Sessão {session_id}: DataFrame vazio")
+            return
+            
+        if df_analysis[['x', 'y', 'z']].isna().all().all():
+            print(f"[DEBUG] Sessão {session_id}: Todos os dados são NaN")
+            return
+            
+        # *** CORREÇÃO: Garantir que temos dados recentes ***
+        # Pega apenas os últimos 500 pontos para análise (evita dados antigos no cache)
+        pontos_para_analise = min(500, len(df_analysis))
+        df_analysis = df_analysis.tail(pontos_para_analise)
+        
+        print(f"[DEBUG] Sessão {session_id}: Analisando {len(df_analysis)} amostras (últimas {pontos_para_analise})")
+        
         # *** OTIMIZAÇÃO: Amostrar dados para evitar sobrecarga ***
         MAX_POINTS_TO_SHOW = 200
         
         # Se temos mais pontos que o máximo, fazemos amostragem
-        if len(df_analysis) > MAX_POINTS_TO_SHOW:
-            step = max(1, len(df_analysis) // MAX_POINTS_TO_SHOW)
-            df_analysis = df_analysis.iloc[::step].reset_index(drop=True)
+        df_for_charts = df_analysis.copy()
+        if len(df_for_charts) > MAX_POINTS_TO_SHOW:
+            step = max(1, len(df_for_charts) // MAX_POINTS_TO_SHOW)
+            df_for_charts = df_for_charts.iloc[::step].reset_index(drop=True)
             # Garantir que temos no máximo MAX_POINTS_TO_SHOW
-            df_analysis = df_analysis.tail(MAX_POINTS_TO_SHOW)
+            df_for_charts = df_for_charts.tail(MAX_POINTS_TO_SHOW)
         
+        # DEBUG: Verificar estatísticas dos dados ANTES do processamento
+        print(f"[DEBUG] Sessão {session_id}: Dados brutos - "
+              f"X[{df_analysis['x'].min():.3f}, {df_analysis['x'].max():.3f}], "
+              f"Y[{df_analysis['y'].min():.3f}, {df_analysis['y'].max():.3f}], "
+              f"Z[{df_analysis['z'].min():.3f}, {df_analysis['z'].max():.3f}]")
+        
+        # Processamento dos sinais
         x_centered = df_analysis['x'] - df_analysis['x'].mean()
         y_centered = df_analysis['y'] - df_analysis['y'].mean()
         z_centered = df_analysis['z'] - df_analysis['z'].mean()
         df_analysis['magnitude'] = np.sqrt(x_centered**2 + y_centered**2 + z_centered**2)
         
+        # DEBUG: Verificar se o centramento não zerou os dados
+        print(f"[DEBUG] Sessão {session_id}: Dados centrados - "
+              f"X[{x_centered.min():.3f}, {x_centered.max():.3f}], "
+              f"Y[{y_centered.min():.3f}, {y_centered.max():.3f}], "
+              f"Z[{z_centered.min():.3f}, {z_centered.max():.3f}]")
+        
+        # Aplicar filtros
         sinal_magnitude_filtrado = filtrar_sinal_passa_faixa(df_analysis['magnitude'].to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
         sinal_x_filtrado = filtrar_sinal_passa_faixa(x_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
         sinal_y_filtrado = filtrar_sinal_passa_faixa(y_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
         sinal_z_filtrado = filtrar_sinal_passa_faixa(z_centered.to_numpy(), FREQ_CORTE_BAIXA, FREQ_CORTE_ALTA, TAXA_AMOSTRAGEM)
 
+        # DEBUG: Verificar sinais filtrados
+        print(f"[DEBUG] Sessão {session_id}: Sinais filtrados - "
+              f"Mag[{len(sinal_magnitude_filtrado)}], "
+              f"X[{len(sinal_x_filtrado)}], Y[{len(sinal_y_filtrado)}], Z[{len(sinal_z_filtrado)}]")
+
+        # Calcular métricas
         intensidade_rms = np.sqrt(np.mean(sinal_magnitude_filtrado**2)) if sinal_magnitude_filtrado.any() else 0.0
         freq_pico = analisar_frequencia_com_welch(sinal_magnitude_filtrado, TAXA_AMOSTRAGEM) if sinal_magnitude_filtrado.any() else 0.0
         freq_pico_x = analisar_frequencia_com_welch(sinal_x_filtrado, TAXA_AMOSTRAGEM) if sinal_x_filtrado.any() else 0.0
@@ -322,9 +369,17 @@ def process_and_push_update(session_id, novas_leituras):
 
         total_amostras_reais = SESSAO_COUNTERS.get(session_id, len(df_analysis))
         
+        # DEBUG: Log das métricas calculadas
+        print(f"[DEBUG] Sessão {session_id}: Métricas - "
+              f"RMS: {intensidade_rms:.4f}, "
+              f"Freq: {freq_pico:.2f}Hz, "
+              f"FreqX: {freq_pico_x:.2f}Hz, "
+              f"FreqY: {freq_pico_y:.2f}Hz, "
+              f"FreqZ: {freq_pico_z:.2f}Hz")
+        
         # *** OTIMIZAÇÃO: Formatar timestamps de forma consistente ***
         labels_cortados = []
-        for ts in df_analysis['timestamp'].tolist():
+        for ts in df_for_charts['timestamp'].tolist():
             try:
                 # Converter timestamp para Date object para o Chart.js
                 date_obj = datetime.fromtimestamp(ts / 1000.0)
@@ -332,10 +387,18 @@ def process_and_push_update(session_id, novas_leituras):
             except:
                 labels_cortados.append(str(ts))
         
-        x_cortado = x_centered.tolist()
-        y_cortado = y_centered.tolist()
-        z_cortado = z_centered.tolist()
-        sinal_filtrado_cortado = sinal_magnitude_filtrado.tolist()
+        # Preparar dados para os gráficos (usando df_for_charts para otimização)
+        x_chart = (df_for_charts['x'] - df_for_charts['x'].mean()).tolist()
+        y_chart = (df_for_charts['y'] - df_for_charts['y'].mean()).tolist()
+        z_chart = (df_for_charts['z'] - df_for_charts['z'].mean()).tolist()
+        
+        # Para o sinal filtrado no chart, usar amostragem proporcional
+        if len(sinal_magnitude_filtrado) > MAX_POINTS_TO_SHOW:
+            step_filtrado = max(1, len(sinal_magnitude_filtrado) // MAX_POINTS_TO_SHOW)
+            sinal_filtrado_cortado = sinal_magnitude_filtrado[::step_filtrado].tolist()
+            sinal_filtrado_cortado = sinal_filtrado_cortado[-MAX_POINTS_TO_SHOW:]
+        else:
+            sinal_filtrado_cortado = sinal_magnitude_filtrado.tolist()
 
         room_name = f'session_room_{session_id}'
         payload = {
@@ -350,20 +413,25 @@ def process_and_push_update(session_id, novas_leituras):
             },
             "charts": {
                 "labels": labels_cortados,
-                "x": x_cortado, 
-                "y": y_cortado, 
-                "z": z_cortado,
+                "x": x_chart, 
+                "y": y_chart, 
+                "z": z_chart,
                 "sinal_filtrado": sinal_filtrado_cortado
             }
         }
+        
         socketio.emit('session_update', payload, room=room_name)
         
+        # Enfileirar análise para o banco de dados
         ultimo_timestamp_sensor = int(df_analysis['timestamp'].iloc[-1])
         analise_data = (session_id, intensidade_rms, freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, ultimo_timestamp_sensor)
         DB_REALTIME_QUEUE.put(('analise', analise_data))
+        
+        print(f"[DEBUG] Sessão {session_id}: Update enviado com sucesso")
 
     except Exception as e:
-        print(f"Erro CRÍTICO em process_and_push_update: {e}")
+        print(f"Erro CRÍTICO em process_and_push_update para sessão {session_id}: {e}")
+        traceback.print_exc()
 
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
@@ -428,10 +496,9 @@ def receber_dados_batch():
         return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
 
 
-
 @app.route('/data', methods=['POST'])
 def receber_dados():
-    """Endpoint para dados em tempo real - usa fila de alta prioridade"""
+    """Endpoint para dados em tempo real - com melhor logging"""
     try:
         payload = request.get_json()
         if not payload or 'sessao_id' not in payload or 'data' not in payload:
@@ -447,19 +514,34 @@ def receber_dados():
         if not leituras_validas:
             return jsonify({"status": "aceito", "message": "Nenhum dado válido"}), 202
 
+        # DEBUG: Log dos dados recebidos
+        primeira = leituras_validas[0]
+        ultima = leituras_validas[-1]
+        print(f"[DEBUG] Sessão {sessao_id}: Recebidas {len(leituras_validas)} leituras, "
+              f"primeira ts={primeira['timestamp']}, última ts={ultima['timestamp']}")
+
         # ENFILEIRA NA FILA DE TEMPO REAL (ALTA PRIORIDADE)
         for l in leituras_validas:
             params = (sessao_id, int(l['timestamp']), l.get('x'), l.get('y'), l.get('z'))
             DB_REALTIME_QUEUE.put(('leitura', params))
 
-        # Resto da lógica (cache, análise) permanece igual
+        # Atualiza cache e contadores
         with SESSAO_LOCKS[sessao_id]:
             if sessao_id in SESSAO_COUNTERS:
                 SESSAO_COUNTERS[sessao_id] += len(leituras_validas)
+            else:
+                # Se não existe, inicializa
+                SESSAO_COUNTERS[sessao_id] = len(leituras_validas)
+                print(f"[DEBUG] Sessão {sessao_id}: Contador inicializado com {len(leituras_validas)}")
             
             cache_deque = SESSAO_CACHE.get(sessao_id)
             if cache_deque is not None:
                 cache_deque.extend(leituras_validas)
+                print(f"[DEBUG] Sessão {sessao_id}: Cache atualizado, agora com {len(cache_deque)} amostras")
+            else:
+                # Se não existe, cria
+                SESSAO_CACHE[sessao_id] = deque(leituras_validas, maxlen=JANELA_DE_ANALISE)
+                print(f"[DEBUG] Sessão {sessao_id}: Cache criado com {len(leituras_validas)} amostras")
         
         socketio.start_background_task(process_and_push_update, session_id=sessao_id, novas_leituras=leituras_validas)
         
@@ -470,11 +552,7 @@ def receber_dados():
         print(f"ERRO INESPERADO em /data: {e}")
         traceback.print_exc()
         return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
-            
-
-# No seu ficheiro analise_tremor.py, substitua a sua função
-# `analisar_dados_historicos` por esta versão otimizada.
-
+    
 def analisar_dados_historicos(session_id):
     """
     Executa a análise histórica completa de uma sessão.
