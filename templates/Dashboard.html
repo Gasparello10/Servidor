@@ -191,43 +191,117 @@
         socket.on('session_started', (data) => {
             loadStructure(true, data.patientId, data.sessionId);
         });
+        let lastUpdateTime = 0;
+        const MIN_UPDATE_INTERVAL = 100; // ms entre atualizações
+
         socket.on('session_update', function(data) {
-    
-            // Apenas processa se a atualização for para a sessão que estamos a ver
+            const now = Date.now();
+            
+            // *** THROTTLING: Limitar atualizações ***
+            if (now - lastUpdateTime < MIN_UPDATE_INTERVAL) {
+                return;
+            }
+            lastUpdateTime = now;
+
+            // *** VERIFICAÇÃO DE INTEGRIDADE DOS DADOS ***
             if (data.sessionId !== currentSessionId) {
                 return;
             }
 
+            if (!data.charts || !data.charts.labels || data.charts.labels.length === 0) {
+                console.warn('Dados de gráfico vazios ou inválidos');
+                return;
+            }
+
+            // *** VERIFICAÇÃO DE CORRUPÇÃO DE DADOS ***
+            if (!Array.isArray(data.charts.labels) || !Array.isArray(data.charts.sinal_filtrado)) {
+                console.error('Dados corrompidos recebidos:', data);
+                return;
+            }
+
+            // Verificar se todos os arrays têm o mesmo comprimento
+            const expectedLength = data.charts.labels.length;
+            const arraysToCheck = [data.charts.x, data.charts.y, data.charts.z, data.charts.sinal_filtrado];
+            
+            for (let arr of arraysToCheck) {
+                if (!Array.isArray(arr) || arr.length !== expectedLength) {
+                    console.error('Arrays de dados com comprimentos inconsistentes:', {
+                        labels: data.charts.labels.length,
+                        x: data.charts.x?.length,
+                        y: data.charts.y?.length,
+                        z: data.charts.z?.length,
+                        sinal_filtrado: data.charts.sinal_filtrado?.length
+                    });
+                    return;
+                }
+            }
+
             // --- 1. ATUALIZAR AS MÉTRICAS ---
-            updateMetricsDisplay(data.metrics);
+            if (data.metrics) {
+                updateMetricsDisplay(data.metrics);
+            }
             
             // --- 2. ATUALIZAR OS GRÁFICOS ---
             const chartData = data.charts;
 
-            // Verifica se os objetos dos gráficos e os dados existem
-            if (magnitudeChart && rawChart && chartData && chartData.labels) {
-                
-                // <<< OTIMIZAÇÃO: O corte de dados foi removido daqui >>>
-                // O JavaScript agora recebe os arrays já com 200 pontos.
+            if (magnitudeChart && rawChart) {
+                try {
+                    // *** CONVERSÃO SEGURA DE DADOS ***
+                    const magnitudeData = chartData.labels.map((label, index) => ({ 
+                        x: label, 
+                        y: Number(chartData.sinal_filtrado[index]) || 0 
+                    }));
+                    const xData = chartData.labels.map((label, index) => ({ 
+                        x: label, 
+                        y: Number(chartData.x[index]) || 0 
+                    }));
+                    const yData = chartData.labels.map((label, index) => ({ 
+                        x: label, 
+                        y: Number(chartData.y[index]) || 0 
+                    }));
+                    const zData = chartData.labels.map((label, index) => ({ 
+                        x: label, 
+                        y: Number(chartData.z[index]) || 0 
+                    }));
 
-                // Transforma os dados recebidos no formato {x, y}
-                const magnitudeData = chartData.labels.map((label, index) => ({ x: label, y: chartData.sinal_filtrado[index] }));
-                const xData = chartData.labels.map((label, index) => ({ x: label, y: chartData.x[index] }));
-                const yData = chartData.labels.map((label, index) => ({ x: label, y: chartData.y[index] }));
-                const zData = chartData.labels.map((label, index) => ({ x: label, y: chartData.z[index] }));
-
-                // Substitui os dados do gráfico pelos novos dados
-                magnitudeChart.data.datasets[0].data = magnitudeData;
-                rawChart.data.datasets[0].data = xData;
-                rawChart.data.datasets[1].data = yData;
-                rawChart.data.datasets[2].data = zData;
-                
-                // Manda o Chart.js redesenhar os gráficos
-                magnitudeChart.update('none');
-                rawChart.update('none');
+                    // *** ATUALIZAÇÃO SEGURA ***
+                    magnitudeChart.data.datasets[0].data = magnitudeData;
+                    rawChart.data.datasets[0].data = xData;
+                    rawChart.data.datasets[1].data = yData;
+                    rawChart.data.datasets[2].data = zData;
+                    
+                    magnitudeChart.update('none');
+                    rawChart.update('none');
+                    
+                } catch (error) {
+                    console.error('Erro ao atualizar gráficos:', error);
+                }
             }
         });
+        function cleanupOldChartData() {
+            const now = new Date();
+            const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000); // 5 minutos atrás
+            
+            if (magnitudeChart) {
+                magnitudeChart.data.datasets[0].data = magnitudeChart.data.datasets[0].data.filter(point => {
+                    const pointTime = new Date(point.x);
+                    return pointTime > fiveMinutesAgo;
+                });
+            }
+            
+            if (rawChart) {
+                rawChart.data.datasets.forEach(dataset => {
+                    dataset.data = dataset.data.filter(point => {
+                        const pointTime = new Date(point.x);
+                        return pointTime > fiveMinutesAgo;
+                    });
+                });
+            }
+        }
 
+        // Chamar a limpeza a cada minuto
+        setInterval(cleanupOldChartData, 60000);
+        
         function updateMetricsDisplay(metrics) {
             if (!metrics) return;
             document.getElementById("rms-value").innerText = (metrics.intensidade_rms || 0).toFixed(4);
@@ -810,57 +884,179 @@
             return Promise.resolve();
         }
         function initializeCharts() {
-            // <<< ALTERAÇÃO: Configura os gráficos de tempo real para usarem um eixo de tempo >>>
-            const commonTimeAxisOptions = {
-                type: 'timeseries',
-                time: {
-                    unit: 'second',
-                    tooltipFormat: 'HH:mm:ss',
-                    displayFormats: {
-                        second: 'HH:mm:ss'
+            try {
+                const commonTimeAxisOptions = {
+                    type: 'timeseries',
+                    time: {
+                        unit: 'second',
+                        tooltipFormat: 'HH:mm:ss',
+                        displayFormats: {
+                            second: 'HH:mm:ss',
+                            minute: 'HH:mm:ss',
+                            hour: 'HH:mm:ss'
+                        }
+                    },
+                    ticks: {
+                        source: 'data',
+                        autoSkip: true,
+                        maxTicksLimit: 8, // *** REDUZIDO PARA MAIOR LEGIBILIDADE ***
+                        maxRotation: 0,
+                        minRotation: 0,
+                    },
+                    grid: {
+                        display: true,
+                        drawOnChartArea: true,
+                        drawTicks: true,
                     }
-                },
-                ticks: {
-                    source: 'data',
-                    autoSkip: true,
-                    maxRotation: 0,
-                    minRotation: 0,
-                    maxTicksLimit: 10,
-                }
-            };
+                };
 
-            const magnitudeCtx = document.getElementById("magnitudeChart").getContext("2d");
-            magnitudeChart = new Chart(magnitudeCtx, {
-                type: "line",
-                data: {
-                    datasets: [{ label: "Sinal de Tremor (Filtrado)", data: [], borderColor: "rgba(90, 90, 158, 1)", borderWidth: 1, pointRadius: 0 }]
-                },
-                options: {
-                    animation: false,
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    scales: { x: commonTimeAxisOptions, y: { title: { display: true, text: 'Amplitude' } } }
+                const magnitudeCtx = document.getElementById("magnitudeChart").getContext("2d");
+                if (!magnitudeCtx) {
+                    throw new Error('Canvas magnitudeChart não encontrado');
                 }
-            });
 
-            const rawCtx = document.getElementById("rawChart").getContext("2d");
-            rawChart = new Chart(rawCtx, {
-                type: "line",
-                data: {
-                    datasets: [
-                        { label: "Eixo X", data: [], borderColor: "rgba(255, 99, 132, 1)", borderWidth: 1, pointRadius: 0 },
-                        { label: "Eixo Y", data: [], borderColor: "rgba(75, 192, 192, 1)", borderWidth: 1, pointRadius: 0 },
-                        { label: "Eixo Z", data: [], borderColor: "rgba(76, 175, 80, 1)", borderWidth: 1, pointRadius: 0 }
-                    ]
-                },
-                options: {
-                    animation: false,
-                    responsive: true,
-                    maintainAspectRatio: true,
-                    scales: { x: commonTimeAxisOptions, y: { title: { display: true, text: 'Aceleração (m/s²)' } } }
+                magnitudeChart = new Chart(magnitudeCtx, {
+                    type: "line",
+                    data: {
+                        datasets: [{ 
+                            label: "Sinal de Tremor (Filtrado)", 
+                            data: [], 
+                            borderColor: "rgba(90, 90, 158, 1)", 
+                            borderWidth: 1.5, // *** AUMENTADO PARA MELHOR VISIBILIDADE ***
+                            pointRadius: 0,
+                            tension: 0.1,
+                            borderJoinStyle: 'round' // *** MELHORA A APARÊNCIA DA LINHA ***
+                        }]
+                    },
+                    options: {
+                        animation: { duration: 0 },
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        scales: { 
+                            x: commonTimeAxisOptions, 
+                            y: { 
+                                title: { display: true, text: 'Amplitude' },
+                                beginAtZero: false
+                            } 
+                        },
+                        plugins: {
+                            legend: {
+                                display: true,
+                                labels: {
+                                    usePointStyle: true,
+                                    padding: 15
+                                }
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        },
+                        interaction: {
+                            intersect: false,
+                            mode: 'nearest'
+                        }
+                    }
+                });
+
+                const rawCtx = document.getElementById("rawChart").getContext("2d");
+                if (!rawCtx) {
+                    throw new Error('Canvas rawChart não encontrado');
                 }
-            });
+
+                rawChart = new Chart(rawCtx, {
+                    type: "line",
+                    data: {
+                        datasets: [
+                            { 
+                                label: "Eixo X", 
+                                data: [], 
+                                borderColor: "rgba(255, 99, 132, 1)", 
+                                borderWidth: 1.2,
+                                pointRadius: 0,
+                                tension: 0.1,
+                                borderJoinStyle: 'round'
+                            },
+                            { 
+                                label: "Eixo Y", 
+                                data: [], 
+                                borderColor: "rgba(75, 192, 192, 1)", 
+                                borderWidth: 1.2,
+                                pointRadius: 0,
+                                tension: 0.1,
+                                borderJoinStyle: 'round'
+                            },
+                            { 
+                                label: "Eixo Z", 
+                                data: [], 
+                                borderColor: "rgba(76, 175, 80, 1)", 
+                                borderWidth: 1.2,
+                                pointRadius: 0,
+                                tension: 0.1,
+                                borderJoinStyle: 'round'
+                            }
+                        ]
+                    },
+                    options: {
+                        animation: { duration: 0 },
+                        responsive: true,
+                        maintainAspectRatio: true,
+                        scales: { 
+                            x: commonTimeAxisOptions, 
+                            y: { 
+                                title: { display: true, text: 'Aceleração (m/s²)' },
+                                beginAtZero: false
+                            } 
+                        },
+                        plugins: {
+                            legend: {
+                                display: true,
+                                labels: {
+                                    usePointStyle: true,
+                                    padding: 15
+                                }
+                            },
+                            tooltip: {
+                                mode: 'index',
+                                intersect: false
+                            }
+                        },
+                        interaction: {
+                            intersect: false,
+                            mode: 'nearest'
+                        }
+                    }
+                });
+
+                console.log('Gráficos inicializados com sucesso');
+            } catch (error) {
+                console.error('Erro na inicialização dos gráficos:', error);
+            }
         }
+        function checkChartHealth() {
+            if (magnitudeChart) {
+                const dataset = magnitudeChart.data.datasets[0];
+                if (dataset.label !== "Sinal de Tremor (Filtrado)") {
+                    console.warn('Label do gráfico magnitude corrompido, reinicializando...');
+                    dataset.label = "Sinal de Tremor (Filtrado)";
+                    magnitudeChart.update();
+                }
+            }
+            
+            if (rawChart) {
+                const expectedLabels = ["Eixo X", "Eixo Y", "Eixo Z"];
+                rawChart.data.datasets.forEach((dataset, index) => {
+                    if (dataset.label !== expectedLabels[index]) {
+                        console.warn(`Label do gráfico raw corrompido no dataset ${index}, corrigindo...`);
+                        dataset.label = expectedLabels[index];
+                    }
+                });
+                rawChart.update();
+            }
+        }
+
+        // Verificar a saúde dos gráficos a cada 5 segundos
+        setInterval(checkChartHealth, 5000);
     </script>
     
 </body>

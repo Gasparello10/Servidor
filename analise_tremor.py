@@ -278,7 +278,6 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
     pico_idx = np.argmax(psd[1:]) + 1
     return freqs[pico_idx]
 
-
 def process_and_push_update(session_id, novas_leituras):
     """
     Processa dados usando o CACHE em memória, envia uma atualização OTIMIZADA
@@ -294,7 +293,17 @@ def process_and_push_update(session_id, novas_leituras):
 
     try:
         df_analysis = pd.DataFrame(janela_completa_copia)
-        # <<< A REMOÇÃO DA MÉDIA ACONTECE AQUI >>>
+        
+        # *** OTIMIZAÇÃO: Amostrar dados para evitar sobrecarga ***
+        MAX_POINTS_TO_SHOW = 200
+        
+        # Se temos mais pontos que o máximo, fazemos amostragem
+        if len(df_analysis) > MAX_POINTS_TO_SHOW:
+            step = max(1, len(df_analysis) // MAX_POINTS_TO_SHOW)
+            df_analysis = df_analysis.iloc[::step].reset_index(drop=True)
+            # Garantir que temos no máximo MAX_POINTS_TO_SHOW
+            df_analysis = df_analysis.tail(MAX_POINTS_TO_SHOW)
+        
         x_centered = df_analysis['x'] - df_analysis['x'].mean()
         y_centered = df_analysis['y'] - df_analysis['y'].mean()
         z_centered = df_analysis['z'] - df_analysis['z'].mean()
@@ -313,13 +322,20 @@ def process_and_push_update(session_id, novas_leituras):
 
         total_amostras_reais = SESSAO_COUNTERS.get(session_id, len(df_analysis))
         
-        MAX_POINTS_TO_SHOW = 200
+        # *** OTIMIZAÇÃO: Formatar timestamps de forma consistente ***
+        labels_cortados = []
+        for ts in df_analysis['timestamp'].tolist():
+            try:
+                # Converter timestamp para Date object para o Chart.js
+                date_obj = datetime.fromtimestamp(ts / 1000.0)
+                labels_cortados.append(date_obj.isoformat())
+            except:
+                labels_cortados.append(str(ts))
         
-        labels_cortados = df_analysis['timestamp'].tolist()[-MAX_POINTS_TO_SHOW:]
-        x_cortado = x_centered.tolist()[-MAX_POINTS_TO_SHOW:]
-        y_cortado = y_centered.tolist()[-MAX_POINTS_TO_SHOW:]
-        z_cortado = z_centered.tolist()[-MAX_POINTS_TO_SHOW:]
-        sinal_filtrado_cortado = sinal_magnitude_filtrado.tolist()[-MAX_POINTS_TO_SHOW:]
+        x_cortado = x_centered.tolist()
+        y_cortado = y_centered.tolist()
+        z_cortado = z_centered.tolist()
+        sinal_filtrado_cortado = sinal_magnitude_filtrado.tolist()
 
         room_name = f'session_room_{session_id}'
         payload = {
@@ -348,8 +364,6 @@ def process_and_push_update(session_id, novas_leituras):
 
     except Exception as e:
         print(f"Erro CRÍTICO em process_and_push_update: {e}")
-
-
 
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
