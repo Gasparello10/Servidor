@@ -180,17 +180,48 @@
         let currentHeatmapData = {};
 
         // --- Lógica de WebSocket ---
-        socket.on('connect', () => socket.emit('join_dashboard'));
+        socket.on('connect', () => {
+            console.log('Socket conectado ao servidor');
+            socket.emit('join_dashboard');
+        });
+
+        // --- Adicionar tratamento de erro de conexão ---
+        socket.on('connect_error', (error) => {
+            console.error('Erro de conexão:', error);
+            alert('Erro de conexão com o servidor. Tentando reconectar...');
+        });
+
         socket.on('state_update', (data) => {
             allOnlinePatients = data.online_patients || [];
             activePatientNames = new Set((data.active_sessions || []).map(s => s.patient_name));
             updatePatientList(allOnlinePatients);
             updateActiveSessionsList(data.active_sessions || []);
         });
+        
         socket.on('structure_changed', () => loadStructure());
         socket.on('session_started', (data) => {
             loadStructure(true, data.patientId, data.sessionId);
         });
+
+        // --- Adicionar listeners para respostas do WebSocket ---
+        socket.on('start_session_response', function(data) {
+            console.log('Resposta start_session:', data);
+            if (data.status === 'sucesso') {
+                console.log('Sessão iniciada com sucesso');
+            } else {
+                alert('Erro ao iniciar sessão: ' + data.message);
+            }
+        });
+
+        socket.on('stop_session_response', function(data) {
+            console.log('Resposta stop_session:', data);
+            if (data.status === 'sucesso') {
+                console.log('Sessão parada com sucesso');
+            } else {
+                alert('Erro ao parar sessão: ' + data.message);
+            }
+        });
+
         let lastUpdateTime = 0;
         const MIN_UPDATE_INTERVAL = 100; // ms entre atualizações
 
@@ -278,6 +309,28 @@
                 }
             }
         });
+
+        // --- Substituir as funções start e stop antigas ---
+        function start(patientName) {
+            // *** CORREÇÃO: Usar WebSocket em vez de HTTP ***
+            if (socket && socket.connected) {
+                socket.emit('start_session_ws', { patientId: patientName });
+                console.log('Enviando comando start para:', patientName);
+            } else {
+                alert('Erro: Não conectado ao servidor. Tente recarregar a página.');
+            }
+        }
+
+        function stop(patientName) {
+            // *** CORREÇÃO: Usar WebSocket em vez de HTTP ***
+            if (socket && socket.connected) {
+                socket.emit('stop_session_ws', { patientId: patientName });
+                console.log('Enviando comando stop para:', patientName);
+            } else {
+                alert('Erro: Não conectado ao servidor. Tente recarregar a página.');
+            }
+        }
+
         function cleanupOldChartData() {
             const now = new Date();
             const fiveMinutesAgo = new Date(now.getTime() - 5 * 60 * 1000); // 5 minutos atrás
@@ -382,13 +435,25 @@
             sessions.forEach(session => {
                 const li = document.createElement('li');
                 li.style.cursor = 'pointer';
+                
+                // Encontra informações do paciente na lista de online para obter bateria
+                const patientInfo = allOnlinePatients.find(p => p.name === session.patient_name);
+                const batteryLevel = patientInfo ? patientInfo.battery : null;
+                const batteryText = batteryLevel ? `🔋 ${batteryLevel}%` : '🔋 --%';
+                
                 const nameSpan = document.createElement('span');
-                nameSpan.innerHTML = `<span class="status-dot" style="background-color: #0d6efd;"></span>${session.patient_name}`;
+                nameSpan.innerHTML = `
+                    <span class="status-dot" style="background-color: #0d6efd;"></span>
+                    ${session.patient_name}
+                    <span style="margin-left: 8px; color: #555; font-size: 0.9em;">${batteryText}</span>
+                `;
                 nameSpan.onclick = () => selectActiveSession(session.patient_id, session.session_id);
+                
                 const stopButtonDiv = document.createElement('div');
                 stopButtonDiv.innerHTML = `<button class="control-btn stop-btn" onclick="stop('${session.patient_name}')">Parar</button>`;
+                
                 li.appendChild(nameSpan);
-                li.appendChild(stopButtonDiv);
+                li.appendChild(stopButtonDiv); // CORRIGIDO: estava stButtonDiv
                 list.appendChild(li);
             });
         }
@@ -780,7 +845,8 @@
             document.getElementById("freq-y-value").innerText = "0.00 Hz";
             document.getElementById("freq-z-value").innerText = "0.00 Hz";
         }
-        function updatePatientList(patientObjects) {
+
+       function updatePatientList(patientObjects) {
             const list = document.getElementById("patient-list");
             list.innerHTML = "";
             if (!patientObjects || patientObjects.length === 0) {
@@ -794,26 +860,30 @@
                 const batteryLevel = patient.battery;
                 const isPatientActive = activePatientNames.has(patientName);
 
-                const batteryText = batteryLevel ? `🔋 ${batteryLevel}%` : '🔋 --%';
-                const patientInfoHtml = `
-                    <span>
-                        <span class="status-dot"></span>
-                        ${patientName}
-                        <span style="margin-left: 8px; color: #555; font-size: 0.9em;">${batteryText}</span>
-                    </span>
-                `;
-                
-                const buttonHtml = isPatientActive 
-                    ? `<span style="font-size: 0.9em; color: green;">Em sessão...</span>`
-                    : `<button class="control-btn start-btn" onclick="start('${patientName}')">Iniciar</button>`;
+                // Apenas mostra pacientes online que NÃO estão em sessão ativa
+                if (!isPatientActive) {
+                    const batteryText = batteryLevel ? `🔋 ${batteryLevel}%` : '🔋 --%';
+                    const patientInfoHtml = `
+                        <span>
+                            <span class="status-dot" style="background-color: #28a745"></span>
+                            ${patientName}
+                            <span style="margin-left: 8px; color: #555; font-size: 0.9em;">${batteryText}</span>
+                        </span>
+                    `;
+                    
+                    const buttonHtml = `<button class="control-btn start-btn" onclick="start('${patientName}')">Iniciar</button>`;
 
-                li.innerHTML = `${patientInfoHtml}<div>${buttonHtml}</div>`;
-                list.appendChild(li);
+                    li.innerHTML = `${patientInfoHtml}<div>${buttonHtml}</div>`;
+                    list.appendChild(li);
+                }
             });
+
+            // Se após filtrar não há pacientes online, mostra mensagem
+            if (list.innerHTML === "") {
+                list.innerHTML = '<li style="color: #888;">Nenhum paciente online.</li>';
+            }
         }
 
-        function start(t) { fetch("/api/start_session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ patientId: t }) }); }
-        function stop(t) { fetch("/api/stop_session", { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify({ patientId: t }) }); }
         function toggleArchiveMode(t) {
             const e = document.getElementById("archive-mode-panel"), n = [document.getElementById("toggle-archive-mode-btn"), document.getElementById("show-archived-btn")];
             n.forEach(e => e.style.display = t ? "none" : "inline-block");

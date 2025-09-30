@@ -122,7 +122,6 @@ def gerenciador_de_analises_periodicas():
                 # Dispara a análise pesada em uma task separada para não bloquear o gerenciador
                 socketio.start_background_task(analisar_dados_historicos, session_id=session_id)
 
-
 def processar_lote_grande(payload, get_db_connection_func):
     """
     Função dedicada a processar um lote grande de dados recebido do endpoint de batch.
@@ -297,7 +296,6 @@ def buscar_total_amostras_banco(session_id):
     finally:
         conn.close()
 
-
 # --- Funções de Análise ---
 def filtrar_sinal_passa_faixa(sinal, freq_corte_baixa, freq_corte_alta, taxa_amostragem):
     if len(sinal) < 34: return np.array([])
@@ -312,6 +310,7 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
     if len(psd) <= 1: return 0.0
     pico_idx = np.argmax(psd[1:]) + 1
     return freqs[pico_idx]
+
 def process_and_push_update(session_id, novas_leituras):
     """
     Processa dados usando o CACHE em memória, envia uma atualização OTIMIZADA
@@ -473,7 +472,6 @@ def process_and_push_update(session_id, novas_leituras):
         import traceback
         traceback.print_exc()
 
-
 def emit_state_update():
     """Envia o estado atual de clientes conectados e sessões ativas."""
     online_patients_list = []
@@ -488,107 +486,6 @@ def emit_state_update():
         'active_sessions': list(active_sessions.values())
     }
     socketio.emit('state_update', state_payload, room='dashboards')
-
-
-# --- Endpoints HTTP ---
-@app.route('/')
-def dashboard():
-    return render_template('dashboard.html', tempo_requisicao_ms=TEMPO_REQUISICAO_MS)
-
-@app.route('/data/batch-upload', methods=['POST'])
-def receber_dados_batch():
-    """Endpoint para dados históricos - usa fila de baixa prioridade"""
-    try:
-        payload = request.get_json()
-        if not payload or 'sessao_id' not in payload or 'data' not in payload:
-            return jsonify({"status": "erro", "message": "Payload inválido"}), 400
-
-        sessao_id = int(payload['sessao_id'])
-        dados_leituras = payload['data']
-        
-        if not dados_leituras:
-            return jsonify({"status": "aceito", "message": "Nenhum dado para processar"}), 202
-
-        leituras_validas = [l for l in dados_leituras if all(k in l for k in ['timestamp', 'x', 'y', 'z'])]
-        
-        if not leituras_validas:
-            return jsonify({"status": "aceito", "message": "Nenhum dado válido encontrado no lote"}), 202
-
-        print(f"Recebido lote histórico para sessão {sessao_id}: {len(leituras_validas)} leituras válidas")
-
-        # ENFILEIRA NA FILA DE BATCH (BAIXA PRIORIDADE)
-        DB_BATCH_QUEUE.put(payload)
-        
-        with SESSOES_LOCK:
-            SESSOES_PARA_REANALISAR.add(sessao_id)
-        
-        print(f"Sessão {sessao_id}: Lote enfileirado para processamento batch.")
-        
-        return jsonify({
-            "status": "aceito", 
-            "message": f"Lote de {len(leituras_validas)} leituras será processado em background",
-            "leituras_validas": len(leituras_validas)
-        }), 202
-
-    except Exception as e:
-        import traceback
-        print(f"ERRO CRÍTICO em /data/batch-upload: {e}")
-        traceback.print_exc()
-        return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
-
-
-@app.route('/data', methods=['POST'])
-def receber_dados():
-    """Endpoint para dados em tempo real"""
-    try:
-        payload = request.get_json()
-        if not payload or 'sessao_id' not in payload or 'data' not in payload:
-            return jsonify({"status": "erro", "message": "Payload inválido"}), 400
-
-        sessao_id = int(payload['sessao_id'])
-        dados_leituras = payload['data']
-        
-        if not dados_leituras:
-            return jsonify({"status": "aceito", "message": "Nenhum dado para processar"}), 202
-
-        leituras_validas = [l for l in dados_leituras if l.get('timestamp')]
-        if not leituras_validas:
-            return jsonify({"status": "aceito", "message": "Nenhum dado válido"}), 202
-
-        # Ordenar leituras por timestamp
-        leituras_validas = sorted(leituras_validas, key=lambda x: x['timestamp'])
-
-        primeira = leituras_validas[0]
-        ultima = leituras_validas[-1]
-        print(f"[DEBUG] Sessão {sessao_id}: Recebidas {len(leituras_validas)} leituras")
-
-        # ENFILEIRA NA FILA DE TEMPO REAL
-        for l in leituras_validas:
-            params = (sessao_id, int(l['timestamp']), l.get('x'), l.get('y'), l.get('z'))
-            DB_REALTIME_QUEUE.put(('leitura', params))
-
-        # *** CORREÇÃO: Atualizar cache mas NÃO o contador ***
-        # O contador será atualizado pela busca REAL do banco
-        with SESSAO_LOCKS[sessao_id]:
-            cache_deque = SESSAO_CACHE.get(sessao_id)
-            if cache_deque is not None:
-                cache_deque.extend(leituras_validas)
-                print(f"[DEBUG] Sessão {sessao_id}: Cache atualizado, agora com {len(cache_deque)} amostras")
-            else:
-                SESSAO_CACHE[sessao_id] = deque(leituras_validas, maxlen=JANELA_DE_ANALISE)
-                print(f"[DEBUG] Sessão {sessao_id}: Cache criado com {len(leituras_validas)} amostras")
-        
-        # Processar atualização
-        socketio.start_background_task(process_and_push_update, session_id=sessao_id, novas_leituras=leituras_validas)
-        
-        return jsonify({"status": "aceito"}), 202
-
-    except Exception as e:
-        import traceback
-        print(f"ERRO INESPERADO em /data: {e}")
-        traceback.print_exc()
-        return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
-    
 
 def analisar_dados_historicos(session_id):
     """
@@ -674,6 +571,10 @@ def analisar_dados_historicos(session_id):
         if conn:
             conn.close()
 
+# --- Endpoints ---
+@app.route('/')
+def dashboard():
+    return render_template('dashboard.html', tempo_requisicao_ms=TEMPO_REQUISICAO_MS)
 
 @app.route('/api/battery_history')
 def get_battery_history():
@@ -756,7 +657,6 @@ def get_archived_patients():
         return jsonify(archived)
     except Exception as e: return jsonify({"error": str(e)}), 500
     finally: conn.close()
-
 
 @app.route('/api/monthly_heatmap')
 def get_monthly_heatmap():
@@ -881,8 +781,6 @@ def get_historical_data():
         traceback.print_exc()
         return jsonify({"error": f"Erro interno no servidor: {str(e)}"}), 500
 
-
-
 @app.route('/api/queue-status')
 def queue_status():
     """Retorna status das filas para monitoramento"""
@@ -892,7 +790,6 @@ def queue_status():
         'active_sessions': len(active_sessions),
         'connected_clients': len(connected_clients)
     })
-
 
 @app.route('/api/initial_session_data')
 def initial_session_data():
@@ -918,137 +815,11 @@ def initial_session_data():
         }
     })
         
-@app.route('/api/start_session', methods=['POST'])
-def start_session():
-    data = request.get_json()
-    patient_name_raw = data.get('patientId')
-    if not patient_name_raw: 
-        return jsonify({"status": "erro", "message": "patientId não fornecido"}), 400
-    
-    patient_name_for_dict = patient_name_raw
-    patient_name_for_db = patient_name_raw.replace(" ", "_").lower()
-
-    client_data = connected_clients.get(patient_name_for_dict)
-    if not client_data: 
-        return jsonify({"status": "erro", "message": "Paciente não conectado via WebSocket."}), 404
-    
-    sid = client_data.get('sid')
-    if not sid:
-        return jsonify({"status": "erro", "message": "SID do paciente não encontrado."}), 500
-    
-    conn = get_db_connection()
-    if not conn: 
-        return jsonify({"status": "erro", "message": "Falha na conexão com o banco"}), 500
-    
-    cursor = conn.cursor()
-    try:
-        cursor.execute("SELECT id FROM pacientes WHERE nome = ?", patient_name_for_db)
-        paciente = cursor.fetchone()
-        if paciente:
-            paciente_id = paciente.id
-        else:
-            cursor.execute("INSERT INTO pacientes (nome) OUTPUT INSERTED.id VALUES (?)", patient_name_for_db)
-            paciente_id = cursor.fetchone().id
-
-        # *** CORREÇÃO: Usar GETDATE() em vez de UTC ***
-        cursor.execute("INSERT INTO sessoes (paciente_id, timestamp_inicio) OUTPUT INSERTED.id VALUES (?, GETDATE())", paciente_id)
-        nova_sessao_id = cursor.fetchone().id
-        
-        # Salvar bateria atual se disponível
-        current_battery = connected_clients[patient_name_for_dict].get('battery')
-        if current_battery is not None:
-            cursor.execute(
-                "INSERT INTO leituras_bateria (sessao_id, timestamp_leitura, nivel_bateria) VALUES (?, GETDATE(), ?)",
-                nova_sessao_id, current_battery
-            )
-            print(f"Bateria inicial {current_battery}% salva para nova sessão {nova_sessao_id}")
-        
-        conn.commit()
-            
-        with SESSAO_LOCKS[nova_sessao_id]:
-            SESSAO_CACHE[nova_sessao_id] = deque(maxlen=JANELA_DE_ANALISE)
-            SESSAO_COUNTERS[nova_sessao_id] = 0
-            
-        active_sessions[patient_name_for_dict] = {
-            'patient_id': paciente_id,
-            'session_id': nova_sessao_id,
-            'patient_name': patient_name_for_dict
-        }
-        
-        socketio.emit('start_monitoring', {'sessao_id': nova_sessao_id}, room=sid)
-        socketio.emit('session_started', {'patientId': paciente_id, 'sessionId': nova_sessao_id}, room='dashboards')
-        emit_state_update()
-
-        print(f"Sessão {nova_sessao_id} iniciada para o paciente '{patient_name_for_dict}' (ID: {paciente_id}).")
-        return jsonify({"status": "sucesso", "message": "Sessão iniciada e registrada no banco."})
-
-    except Exception as e: 
-        conn.rollback()
-        return jsonify({"status": "erro", "message": str(e)}), 500
-    finally: 
-        conn.close()
-
-# Endpoint para reprocessar uma sessão
 @app.route('/api/reprocessar_sessao/<int:session_id>', methods=['GET', 'POST'])
 def reprocessar_sessao(session_id):
     print(f"Recebida requisição para reprocessar a sessão {session_id}")
     socketio.start_background_task(analisar_dados_historicos, session_id=session_id)
     return jsonify({"status": "sucesso", "message": f"Análise da sessão {session_id} foi iniciada em background."})
-
-
-@app.route('/api/stop_session', methods=['POST'])
-def stop_session():
-    data = request.get_json()
-    patient_name = data.get('patientId') 
-    
-    print(f"\n--- TENTATIVA DE PARAR SESSÃO para o paciente: '{patient_name}' ---")
-
-    if not patient_name or patient_name not in active_sessions:
-        print(f"[AVISO] Nenhuma sessão ativa encontrada para '{patient_name}'.")
-        emit_state_update()
-        socketio.emit('structure_changed')
-        return jsonify({"status": "sucesso", "message": "Nenhuma sessão ativa para parar."})
-
-    session_info = active_sessions.pop(patient_name)
-    session_id_to_stop = session_info.get('session_id')
-    
-    print(f"Sessão ativa encontrada: ID {session_id_to_stop} para o paciente '{patient_name}'.")
-
-    with SESSAO_LOCKS[session_id_to_stop]:
-        if session_id_to_stop in SESSAO_CACHE:
-            del SESSAO_CACHE[session_id_to_stop]
-            print(f"Cache para a sessão {session_id_to_stop} foi limpo.")
-
-    if session_id_to_stop in last_timestamp_sent:
-        del last_timestamp_sent[session_id_to_stop]
-        print(f"Estado de timestamp para a sessão {session_id_to_stop} foi limpo.")
-
-    # <<< MUDANÇA: Limpa o contador da memória >>>
-    if session_id_to_stop in SESSAO_COUNTERS:
-        del SESSAO_COUNTERS[session_id_to_stop]
-        print(f"Contador para a sessão {session_id_to_stop} foi limpo.")
-
-    client_data = connected_clients.get(patient_name)
-    if client_data and 'sid' in client_data:
-        sid = client_data['sid']
-        socketio.emit('stop_monitoring', room=sid)
-        print(f"Comando 'stop_monitoring' enviado para o SID: {sid}")
-    else:
-        print("Nenhum cliente conectado encontrado para enviar o comando 'stop_monitoring'.")
-    
-    # Adicionando a análise final como garantia
-    if session_id_to_stop:
-        print(f"Agendando análise histórica final para a sessão {session_id_to_stop}.")
-        socketio.start_background_task(analisar_dados_historicos, session_id=session_id_to_stop)
-    
-    print(f"Sessão do paciente '{patient_name}' removida da lista de ativas.")
-
-    emit_state_update()
-    socketio.emit('structure_changed')
-    
-    print("--- FIM DA OPERAÇÃO DE PARADA DE SESSÃO ---")
-    return jsonify({"status": "sucesso", "message": "Comando de parada processado."})
-
 
 @socketio.on('connect')
 def handle_connect(): print(f"Novo cliente conectado: {request.sid}")
@@ -1264,40 +1035,324 @@ def handle_resume_session(data):
         if conn: 
             conn.close()
 
-
-@app.route('/data/offline-recovery', methods=['POST'])
-def receber_dados_offline():
-    """
-    Endpoint específico para recuperação de dados offline
-    """
+@socketio.on('upload_batch_data')
+def handle_upload_batch_data(data):
+    """WebSocket para dados históricos - substitui /data/batch-upload"""
     try:
-        payload = request.get_json()
-        if not payload or 'sessao_id' not in payload or 'data' not in payload:
-            return jsonify({"status": "erro", "message": "Payload inválido"}), 400
+        if not data or 'sessao_id' not in data or 'data' not in data:
+            emit('batch_upload_response', {
+                "status": "erro", 
+                "message": "Payload inválido"
+            })
+            return
 
-        sessao_id = int(payload['sessao_id'])
-        dados_leituras = payload['data']
+        sessao_id = int(data['sessao_id'])
+        dados_leituras = data['data']
         
         if not dados_leituras:
-            return jsonify({"status": "sucesso", "message": "Nenhum dado para processar"}), 200
+            emit('batch_upload_response', {
+                "status": "aceito", 
+                "message": "Nenhum dado para processar"
+            })
+            return
 
-        print(f"📱 Recebida recuperação offline para sessão {sessao_id}: {len(dados_leituras)} leituras")
+        leituras_validas = [l for l in dados_leituras if all(k in l for k in ['timestamp', 'x', 'y', 'z'])]
+        
+        if not leituras_validas:
+            emit('batch_upload_response', {
+                "status": "aceito", 
+                "message": "Nenhum dado válido encontrado no lote"
+            })
+            return
 
-        # Processar em background sem sobrecarregar
+        print(f"Recebido lote histórico via WebSocket para sessão {sessao_id}: {len(leituras_validas)} leituras válidas")
+
+        # ENFILEIRA NA FILA DE BATCH (BAIXA PRIORIDADE)
+        payload = {
+            'sessao_id': sessao_id,
+            'data': leituras_validas
+        }
+        DB_BATCH_QUEUE.put(payload)
+        
+        with SESSOES_LOCK:
+            SESSOES_PARA_REANALISAR.add(sessao_id)
+        
+        print(f"Sessão {sessao_id}: Lote enfileirado para processamento batch via WebSocket.")
+        
+        emit('batch_upload_response', {
+            "status": "aceito", 
+            "message": f"Lote de {len(leituras_validas)} leituras será processado em background",
+            "leituras_validas": len(leituras_validas)
+        })
+
+    except Exception as e:
+        import traceback
+        print(f"ERRO CRÍTICO em upload_batch_data: {e}")
+        traceback.print_exc()
+        emit('batch_upload_response', {
+            "status": "erro", 
+            "message": "Erro interno inesperado"
+        })
+
+@socketio.on('upload_realtime_data')
+def handle_upload_realtime_data(data):
+    """WebSocket para dados em tempo real - substitui /data"""
+    try:
+        if not data or 'sessao_id' not in data or 'data' not in data:
+            emit('realtime_upload_response', {
+                "status": "erro", 
+                "message": "Payload inválido"
+            })
+            return
+
+        sessao_id = int(data['sessao_id'])
+        dados_leituras = data['data']
+        
+        if not dados_leituras:
+            emit('realtime_upload_response', {
+                "status": "aceito", 
+                "message": "Nenhum dado para processar"
+            })
+            return
+
+        leituras_validas = [l for l in dados_leituras if l.get('timestamp')]
+        if not leituras_validas:
+            emit('realtime_upload_response', {
+                "status": "aceito", 
+                "message": "Nenhum dado válido"
+            })
+            return
+
+        # Ordenar leituras por timestamp
+        leituras_validas = sorted(leituras_validas, key=lambda x: x['timestamp'])
+
+        primeira = leituras_validas[0]
+        ultima = leituras_validas[-1]
+        print(f"[DEBUG] Sessão {sessao_id}: Recebidas {len(leituras_validas)} leituras via WebSocket")
+
+        # ENFILEIRA NA FILA DE TEMPO REAL
+        for l in leituras_validas:
+            params = (sessao_id, int(l['timestamp']), l.get('x'), l.get('y'), l.get('z'))
+            DB_REALTIME_QUEUE.put(('leitura', params))
+
+        # Atualizar cache
+        with SESSAO_LOCKS[sessao_id]:
+            cache_deque = SESSAO_CACHE.get(sessao_id)
+            if cache_deque is not None:
+                cache_deque.extend(leituras_validas)
+                print(f"[DEBUG] Sessão {sessao_id}: Cache atualizado, agora com {len(cache_deque)} amostras")
+            else:
+                SESSAO_CACHE[sessao_id] = deque(leituras_validas, maxlen=JANELA_DE_ANALISE)
+                print(f"[DEBUG] Sessão {sessao_id}: Cache criado com {len(leituras_validas)} amostras")
+        
+        # Processar atualização
+        socketio.start_background_task(process_and_push_update, session_id=sessao_id, novas_leituras=leituras_validas)
+        
+        emit('realtime_upload_response', {
+            "status": "aceito"
+        })
+
+    except Exception as e:
+        import traceback
+        print(f"ERRO INESPERADO em upload_realtime_data: {e}")
+        traceback.print_exc()
+        emit('realtime_upload_response', {
+            "status": "erro", 
+            "message": "Erro interno inesperado"
+        })
+
+@socketio.on('upload_offline_data')
+def handle_upload_offline_data(data):
+    """WebSocket para recuperação de dados offline - substitui /data/offline-recovery"""
+    try:
+        if not data or 'sessao_id' not in data or 'data' not in data:
+            emit('offline_upload_response', {
+                "status": "erro", 
+                "message": "Payload inválido"
+            })
+            return
+
+        sessao_id = int(data['sessao_id'])
+        dados_leituras = data['data']
+        
+        if not dados_leituras:
+            emit('offline_upload_response', {
+                "status": "sucesso", 
+                "message": "Nenhum dado para processar"
+            })
+            return
+
+        print(f"📱 Recebida recuperação offline via WebSocket para sessão {sessao_id}: {len(dados_leituras)} leituras")
+
+        # Processar em background
         socketio.start_background_task(
             processar_dados_offline, 
             sessao_id, 
             dados_leituras
         )
         
-        return jsonify({
+        emit('offline_upload_response', {
             "status": "aceito", 
             "message": f"Dados offline serão processados em background"
-        }), 202
+        })
 
     except Exception as e:
-        print(f"❌ ERRO em /data/offline-recovery: {e}")
-        return jsonify({"status": "erro", "message": "Erro interno"}), 500
+        print(f"❌ ERRO em upload_offline_data: {e}")
+        emit('offline_upload_response', {
+            "status": "erro", 
+            "message": "Erro interno"
+        })
+
+@socketio.on('start_session_ws')
+def handle_start_session_ws(data):
+    """WebSocket para iniciar sessão - substitui /api/start_session"""
+    patient_name_raw = data.get('patientId')
+    if not patient_name_raw: 
+        emit('start_session_response', {
+            "status": "erro", 
+            "message": "patientId não fornecido"
+        })
+        return
+    
+    patient_name_for_dict = patient_name_raw
+    patient_name_for_db = patient_name_raw.replace(" ", "_").lower()
+
+    client_data = connected_clients.get(patient_name_for_dict)
+    if not client_data: 
+        emit('start_session_response', {
+            "status": "erro", 
+            "message": "Paciente não conectado via WebSocket."
+        })
+        return
+    
+    sid = client_data.get('sid')
+    if not sid:
+        emit('start_session_response', {
+            "status": "erro", 
+            "message": "SID do paciente não encontrado."
+        })
+        return
+    
+    conn = get_db_connection()
+    if not conn: 
+        emit('start_session_response', {
+            "status": "erro", 
+            "message": "Falha na conexão com o banco"
+        })
+        return
+    
+    cursor = conn.cursor()
+    try:
+        cursor.execute("SELECT id FROM pacientes WHERE nome = ?", patient_name_for_db)
+        paciente = cursor.fetchone()
+        if paciente:
+            paciente_id = paciente.id
+        else:
+            cursor.execute("INSERT INTO pacientes (nome) OUTPUT INSERTED.id VALUES (?)", patient_name_for_db)
+            paciente_id = cursor.fetchone().id
+
+        cursor.execute("INSERT INTO sessoes (paciente_id, timestamp_inicio) OUTPUT INSERTED.id VALUES (?, GETDATE())", paciente_id)
+        nova_sessao_id = cursor.fetchone().id
+        
+        # Salvar bateria atual se disponível
+        current_battery = connected_clients[patient_name_for_dict].get('battery')
+        if current_battery is not None:
+            cursor.execute(
+                "INSERT INTO leituras_bateria (sessao_id, timestamp_leitura, nivel_bateria) VALUES (?, GETDATE(), ?)",
+                nova_sessao_id, current_battery
+            )
+            print(f"Bateria inicial {current_battery}% salva para nova sessão {nova_sessao_id}")
+        
+        conn.commit()
+            
+        with SESSAO_LOCKS[nova_sessao_id]:
+            SESSAO_CACHE[nova_sessao_id] = deque(maxlen=JANELA_DE_ANALISE)
+            SESSAO_COUNTERS[nova_sessao_id] = 0
+            
+        active_sessions[patient_name_for_dict] = {
+            'patient_id': paciente_id,
+            'session_id': nova_sessao_id,
+            'patient_name': patient_name_for_dict
+        }
+        
+        socketio.emit('start_monitoring', {'sessao_id': nova_sessao_id}, room=sid)
+        socketio.emit('session_started', {'patientId': paciente_id, 'sessionId': nova_sessao_id}, room='dashboards')
+        emit_state_update()
+
+        print(f"Sessão {nova_sessao_id} iniciada para o paciente '{patient_name_for_dict}' (ID: {paciente_id}).")
+        emit('start_session_response', {
+            "status": "sucesso", 
+            "message": "Sessão iniciada e registrada no banco.",
+            "sessionId": nova_sessao_id
+        })
+
+    except Exception as e: 
+        conn.rollback()
+        emit('start_session_response', {
+            "status": "erro", 
+            "message": str(e)
+        })
+    finally: 
+        conn.close()
+
+@socketio.on('stop_session_ws')
+def handle_stop_session_ws(data):
+    """WebSocket para parar sessão - substitui /api/stop_session"""
+    patient_name = data.get('patientId') 
+    
+    print(f"\n--- TENTATIVA DE PARAR SESSÃO via WebSocket para o paciente: '{patient_name}' ---")
+
+    if not patient_name or patient_name not in active_sessions:
+        print(f"[AVISO] Nenhuma sessão ativa encontrada para '{patient_name}'.")
+        emit_state_update()
+        socketio.emit('structure_changed')
+        emit('stop_session_response', {
+            "status": "sucesso", 
+            "message": "Nenhuma sessão ativa para parar."
+        })
+        return
+
+    session_info = active_sessions.pop(patient_name)
+    session_id_to_stop = session_info.get('session_id')
+    
+    print(f"Sessão ativa encontrada: ID {session_id_to_stop} para o paciente '{patient_name}'.")
+
+    with SESSAO_LOCKS[session_id_to_stop]:
+        if session_id_to_stop in SESSAO_CACHE:
+            del SESSAO_CACHE[session_id_to_stop]
+            print(f"Cache para a sessão {session_id_to_stop} foi limpo.")
+
+    if session_id_to_stop in last_timestamp_sent:
+        del last_timestamp_sent[session_id_to_stop]
+        print(f"Estado de timestamp para a sessão {session_id_to_stop} foi limpo.")
+
+    if session_id_to_stop in SESSAO_COUNTERS:
+        del SESSAO_COUNTERS[session_id_to_stop]
+        print(f"Contador para a sessão {session_id_to_stop} foi limpo.")
+
+    client_data = connected_clients.get(patient_name)
+    if client_data and 'sid' in client_data:
+        sid = client_data['sid']
+        socketio.emit('stop_monitoring', room=sid)
+        print(f"Comando 'stop_monitoring' enviado para o SID: {sid}")
+    else:
+        print("Nenhum cliente conectado encontrado para enviar o comando 'stop_monitoring'.")
+    
+    # Adicionando a análise final como garantia
+    if session_id_to_stop:
+        print(f"Agendando análise histórica final para a sessão {session_id_to_stop}.")
+        socketio.start_background_task(analisar_dados_historicos, session_id=session_id_to_stop)
+    
+    print(f"Sessão do paciente '{patient_name}' removida da lista de ativas.")
+
+    emit_state_update()
+    socketio.emit('structure_changed')
+    
+    print("--- FIM DA OPERAÇÃO DE PARADA DE SESSÃO ---")
+    emit('stop_session_response', {
+        "status": "sucesso", 
+        "message": "Comando de parada processado."
+    })
 
 
 # ==========================
