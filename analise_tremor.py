@@ -19,6 +19,21 @@ from queue import Queue # <<< NOVA IMPLEMENTAÇÃO >>> Fila para inserções no 
 import pytz
 import traceback
 
+# --- Configurações do servidor ---
+HOST = '0.0.0.0'
+PORT = 5000
+TEMPO_REQUISICAO_MS = 500 # Intervalo entre atualizações no dashboard (ms) - AGORA USADO APENAS COMO REFERÊNCIA
+
+# --- Configurações de banco de dados ---
+CONN_STR = (
+    r'DRIVER={ODBC Driver 17 for SQL Server};'
+    #r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
+    r'SERVER=localhost;'
+    r'DATABASE=AnaliseTremorDB_Teste;'
+    r'Trusted_Connection=yes;'
+)
+
+
 
 # ==========================
 # CONFIGURAÇÕES GLOBAIS
@@ -47,20 +62,6 @@ DB_BATCH_QUEUE = Queue()     # Dados históricos/batch (baixa prioridade)
 # Número de workers configuráveis
 NUM_REALTIME_WORKERS = 4     # Workers para dados em tempo real
 NUM_BATCH_WORKERS = 5        # Workers para dados batch
-
-# --- Configurações do servidor ---
-HOST = '0.0.0.0'
-PORT = 5000
-TEMPO_REQUISICAO_MS = 500 # Intervalo entre atualizações no dashboard (ms) - AGORA USADO APENAS COMO REFERÊNCIA
-
-# --- Configurações de banco de dados ---
-CONN_STR = (
-    r'DRIVER={ODBC Driver 17 for SQL Server};'
-    #r'SERVER=DESKTOP-02VR8MO\SQLEXPRESS;'
-    r'SERVER=localhost;'
-    r'DATABASE=AnaliseTremorDB_Teste;'
-    r'Trusted_Connection=yes;'
-)
 
 # --- Ajustes de log ---
 LOG_LEVEL = logging.ERROR  # logging.DEBUG, logging.INFO, etc.
