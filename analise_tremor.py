@@ -30,6 +30,8 @@ FREQ_CORTE_ALTA = 8.0             # Hz
 JANELA_DE_ANALISE = 1000          # Nº de amostras para cálculo de RMS e Welch
 NPERSEG_WELCH = 512 
 
+CONTADORES_LONGO_PRAZO = {}  # {session_id: ContadorOtimizadoLongo}
+PRIMEIRO_TIMESTAMP = {}      # {session_id: primeiro_timestamp}
 SESSOES_PARA_REANALISAR = set()
 SESSAO_CACHE = {}
 SESSAO_COUNTERS = {}
@@ -70,7 +72,15 @@ log = logging.getLogger('werkzeug')
 log.setLevel(LOG_LEVEL)
 app = Flask(__name__)
 # Certifique-se de que o async_mode é compatível com o seu servidor de produção (eventlet/gevent)
-socketio = SocketIO(app, async_mode="eventlet", ping_timeout=20, ping_interval=10)
+# Na seção de inicialização, modifique o SocketIO:
+socketio = SocketIO(
+    app, 
+    async_mode="eventlet", 
+    ping_timeout=60,  # Aumentar timeout
+    ping_interval=25,
+    max_http_buffer_size=10 * 1024 * 1024,  # 10MB buffer
+    cors_allowed_origins="*"
+)
 connected_clients = {}
 # Formato: { 'paciente_nome': {'patient_id': 1, 'session_id': 10, 'patient_name': 'nome'} }
 active_sessions = {}
@@ -169,7 +179,6 @@ def processar_lote_grande(payload, get_db_connection_func):
 def database_realtime_writer_job():
     """
     Worker especializado para dados em tempo real.
-    Prioridade: baixa latência, processamento rápido.
     """
     leituras_batch = []
     analises_batch = []
@@ -210,10 +219,11 @@ def database_realtime_writer_job():
                         leituras_batch.clear()
 
                     if analises_batch:
+                        # *** CORREÇÃO: Usar data/hora local em vez de UTC ***
                         sql_analises = """
                             INSERT INTO analises_janela (sessao_id, timestamp_janela, intensidade_rms, 
                                    freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms) 
-                            VALUES (?, GETUTCDATE(), ?, ?, ?, ?, ?, ?)
+                            VALUES (?, GETDATE(), ?, ?, ?, ?, ?, ?)
                         """
                         cursor.executemany(sql_analises, analises_batch)
                         print(f"RealTime Worker: Inseridas {len(analises_batch)} análises")
@@ -230,12 +240,10 @@ def database_realtime_writer_job():
                 except pyodbc.Error as e:
                     print(f"RealTime Worker ERRO: {e}")
                     conn.rollback()
-                    # Em caso de erro, limpa os batches para evitar loops
                     leituras_batch.clear(); analises_batch.clear(); bateria_batch.clear()
                 finally:
                     conn.close()
 
-            # Pequeno sleep para não consumir CPU excessivamente
             time.sleep(0.1)
             
         except Exception as e:
@@ -263,7 +271,32 @@ def database_batch_writer_job():
         except Exception as e:
             print(f"Erro crítico no Batch Worker: {e}")
             time.sleep(5)
-            
+
+def buscar_total_amostras_banco(session_id):
+    """
+    Busca o número REAL de amostras no banco de dados
+    """
+    conn = get_db_connection()
+    if not conn:
+        return SESSAO_COUNTERS.get(session_id, 0)  # Fallback para contador em memória
+    
+    try:
+        cursor = conn.cursor()
+        cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", session_id)
+        result = cursor.fetchone()
+        total = result[0] if result else 0
+        
+        # *** ATUALIZAR contador em memória com valor REAL ***
+        SESSAO_COUNTERS[session_id] = total
+        
+        return total
+    except Exception as e:
+        print(f"Erro ao buscar total de amostras para sessão {session_id}: {e}")
+        return SESSAO_COUNTERS.get(session_id, 0)
+    finally:
+        conn.close()
+
+
 # --- Funções de Análise ---
 def filtrar_sinal_passa_faixa(sinal, freq_corte_baixa, freq_corte_alta, taxa_amostragem):
     if len(sinal) < 34: return np.array([])
@@ -278,7 +311,6 @@ def analisar_frequencia_com_welch(sinal_filtrado, taxa_amostragem):
     if len(psd) <= 1: return 0.0
     pico_idx = np.argmax(psd[1:]) + 1
     return freqs[pico_idx]
-
 def process_and_push_update(session_id, novas_leituras):
     """
     Processa dados usando o CACHE em memória, envia uma atualização OTIMIZADA
@@ -293,8 +325,33 @@ def process_and_push_update(session_id, novas_leituras):
             janela_completa_copia = list(cache_deque)
             total_amostras_cache = len(janela_completa_copia)
     
-    # Se não há dados suficientes, espera acumular mais
+    # *** CORREÇÃO: Buscar sempre o total REAL do banco de dados ***
+    total_amostras_reais = buscar_total_amostras_banco(session_id)
+    
+    # Se não há dados suficientes no cache, mas temos dados no banco, enviar atualização mínima
     if total_amostras_cache < 50:
+        if total_amostras_reais > 0:
+            # Enviar apenas o contador atualizado
+            room_name = f'session_room_{session_id}'
+            payload = {
+                "sessionId": session_id,
+                "metrics": {
+                    "total_amostras": total_amostras_reais, 
+                    "intensidade_rms": 0, 
+                    "freq_dominante": 0,
+                    "freq_pico_x": 0,
+                    "freq_pico_y": 0,
+                    "freq_pico_z": 0
+                },
+                "charts": {
+                    "labels": [],
+                    "x": [], 
+                    "y": [], 
+                    "z": [],
+                    "sinal_filtrado": []
+                }
+            }
+            socketio.emit('session_update', payload, room=room_name)
         return
 
     try:
@@ -357,8 +414,9 @@ def process_and_push_update(session_id, novas_leituras):
         freq_pico_y = analisar_frequencia_com_welch(sinal_y_filtrado, TAXA_AMOSTRAGEM) if sinal_y_filtrado.any() else 0.0
         freq_pico_z = analisar_frequencia_com_welch(sinal_z_filtrado, TAXA_AMOSTRAGEM) if sinal_z_filtrado.any() else 0.0
 
-        total_amostras_reais = SESSAO_COUNTERS.get(session_id, len(df_analysis))
-        
+        # *** IMPORTANTE: total_amostras_reais já foi calculado no início da função ***
+        # usando buscar_total_amostras_banco(session_id)
+
         # *** OTIMIZAÇÃO: Formatar timestamps de forma consistente ***
         labels_cortados = []
         for ts in df_for_charts['timestamp'].tolist():
@@ -386,7 +444,7 @@ def process_and_push_update(session_id, novas_leituras):
         payload = {
             "sessionId": session_id,
             "metrics": {
-                "total_amostras": total_amostras_reais, 
+                "total_amostras": total_amostras_reais,  # *** DADO MAIS IMPORTANTE - SEMPRE REAL ***
                 "intensidade_rms": intensidade_rms, 
                 "freq_dominante": freq_pico,
                 "freq_pico_x": freq_pico_x,
@@ -477,9 +535,10 @@ def receber_dados_batch():
         traceback.print_exc()
         return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
 
+
 @app.route('/data', methods=['POST'])
 def receber_dados():
-    """Endpoint para dados em tempo real - com melhor logging"""
+    """Endpoint para dados em tempo real"""
     try:
         payload = request.get_json()
         if not payload or 'sessao_id' not in payload or 'data' not in payload:
@@ -495,39 +554,30 @@ def receber_dados():
         if not leituras_validas:
             return jsonify({"status": "aceito", "message": "Nenhum dado válido"}), 202
 
-        # *** CORREÇÃO: Ordenar leituras por timestamp antes de processar ***
+        # Ordenar leituras por timestamp
         leituras_validas = sorted(leituras_validas, key=lambda x: x['timestamp'])
 
-        # DEBUG: Log dos dados recebidos
         primeira = leituras_validas[0]
         ultima = leituras_validas[-1]
-        print(f"[DEBUG] Sessão {sessao_id}: Recebidas {len(leituras_validas)} leituras, "
-              f"primeira ts={primeira['timestamp']}, última ts={ultima['timestamp']}")
+        print(f"[DEBUG] Sessão {sessao_id}: Recebidas {len(leituras_validas)} leituras")
 
-        # ENFILEIRA NA FILA DE TEMPO REAL (ALTA PRIORIDADE)
+        # ENFILEIRA NA FILA DE TEMPO REAL
         for l in leituras_validas:
             params = (sessao_id, int(l['timestamp']), l.get('x'), l.get('y'), l.get('z'))
             DB_REALTIME_QUEUE.put(('leitura', params))
 
-        # Atualiza cache e contadores
+        # *** CORREÇÃO: Atualizar cache mas NÃO o contador ***
+        # O contador será atualizado pela busca REAL do banco
         with SESSAO_LOCKS[sessao_id]:
-            if sessao_id in SESSAO_COUNTERS:
-                SESSAO_COUNTERS[sessao_id] += len(leituras_validas)
-            else:
-                # Se não existe, inicializa
-                SESSAO_COUNTERS[sessao_id] = len(leituras_validas)
-                print(f"[DEBUG] Sessão {sessao_id}: Contador inicializado com {len(leituras_validas)}")
-            
             cache_deque = SESSAO_CACHE.get(sessao_id)
             if cache_deque is not None:
-                # *** CORREÇÃO: Adicionar leituras já ordenadas ao cache ***
                 cache_deque.extend(leituras_validas)
                 print(f"[DEBUG] Sessão {sessao_id}: Cache atualizado, agora com {len(cache_deque)} amostras")
             else:
-                # Se não existe, cria
                 SESSAO_CACHE[sessao_id] = deque(leituras_validas, maxlen=JANELA_DE_ANALISE)
                 print(f"[DEBUG] Sessão {sessao_id}: Cache criado com {len(leituras_validas)} amostras")
         
+        # Processar atualização
         socketio.start_background_task(process_and_push_update, session_id=sessao_id, novas_leituras=leituras_validas)
         
         return jsonify({"status": "aceito"}), 202
@@ -537,11 +587,11 @@ def receber_dados():
         print(f"ERRO INESPERADO em /data: {e}")
         traceback.print_exc()
         return jsonify({"status": "erro", "message": "Erro interno inesperado"}), 500
-        
+    
+
 def analisar_dados_historicos(session_id):
     """
     Executa a análise histórica completa de uma sessão.
-    Esta versão é otimizada para não bloquear o servidor durante o processamento.
     """
     print(f"Iniciando análise histórica completa para a sessão {session_id}...")
     
@@ -566,7 +616,6 @@ def analisar_dados_historicos(session_id):
         analises_para_inserir = []
         passo_da_janela = TAXA_AMOSTRAGEM 
         
-        # Otimização: processa em blocos para chamar sleep com menos frequência
         process_counter = 0
 
         for i in range(0, len(df) - JANELA_DE_ANALISE, passo_da_janela):
@@ -597,22 +646,20 @@ def analisar_dados_historicos(session_id):
             )
             analises_para_inserir.append(analise_data)
 
-            # <<< OTIMIZAÇÃO DE DESEMPENHO >>>
-            # A cada 100 cálculos, fazemos uma pequena pausa para permitir que
-            # outras tarefas do servidor (como receber novos dados) sejam executadas.
             process_counter += 1
             if process_counter % 100 == 0:
-                eventlet.sleep(0) # Libera o controle para o event loop
+                eventlet.sleep(0)
 
         if analises_para_inserir:
             cursor = conn.cursor()
             cursor.execute("DELETE FROM analises_janela WHERE sessao_id = ?", session_id)
             
+            # *** CORREÇÃO: Usar GETDATE() em vez de GETUTCDATE() ***
             sql_insert_analise = """
                 INSERT INTO analises_janela (
-                    sessao_id, intensidade_rms, freq_pico, 
-                    freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms
-                ) VALUES (?, ?, ?, ?, ?, ?, ?);
+                    sessao_id, timestamp_janela, intensidade_rms, 
+                    freq_pico, freq_pico_x, freq_pico_y, freq_pico_z, timestamp_sensor_ms
+                ) VALUES (?, GETDATE(), ?, ?, ?, ?, ?, ?);
             """
             cursor.executemany(sql_insert_analise, analises_para_inserir)
             conn.commit()
@@ -625,6 +672,7 @@ def analisar_dados_historicos(session_id):
     finally:
         if conn:
             conn.close()
+
 
 @app.route('/api/battery_history')
 def get_battery_history():
@@ -844,43 +892,31 @@ def queue_status():
         'connected_clients': len(connected_clients)
     })
 
+
 @app.route('/api/initial_session_data')
 def initial_session_data():
     session_id = request.args.get('id')
     if not session_id:
         return jsonify({"error": "ID da sessão não especificado"}), 400
 
-    conn = get_db_connection()
-    if not conn:
-        return jsonify({"error": "Falha na conexão com o banco"}), 500
-    cursor = conn.cursor()
+    # *** CORREÇÃO: Buscar total REAL do banco ***
+    total_amostras = buscar_total_amostras_banco(int(session_id))
 
-    try:
-        # Apenas conta quantas leituras já existem
-        cursor.execute("SELECT COUNT(id) FROM leituras WHERE sessao_id = ?", int(session_id))
-        total_amostras = cursor.fetchone()[0]
-
-        # Retorna apenas o mínimo necessário
-        return jsonify({
-            "metrics": {
-                "freq_dominante": None,   # não calculamos aqui
-                "intensidade_rms": None,  # não calculamos aqui
-                "total_amostras": total_amostras
-            },
-            "charts": {
-                "labels": [],             # gráfico começa vazio
-                "x": [],
-                "y": [],
-                "z": [],
-                "sinal_filtrado": []
-            }
-        })
-    except Exception as e:
-        import traceback
-        traceback.print_exc()
-        return jsonify({"error": str(e)}), 500
-    finally:
-        conn.close()
+    return jsonify({
+        "metrics": {
+            "freq_dominante": None,
+            "intensidade_rms": None,
+            "total_amostras": total_amostras  # *** DADO CORRETO ***
+        },
+        "charts": {
+            "labels": [],
+            "x": [],
+            "y": [],
+            "z": [],
+            "sinal_filtrado": []
+        }
+    })
+        
 @app.route('/api/start_session', methods=['POST'])
 def start_session():
     data = request.get_json()
@@ -913,10 +949,11 @@ def start_session():
             cursor.execute("INSERT INTO pacientes (nome) OUTPUT INSERTED.id VALUES (?)", patient_name_for_db)
             paciente_id = cursor.fetchone().id
 
+        # *** CORREÇÃO: Usar GETDATE() em vez de UTC ***
         cursor.execute("INSERT INTO sessoes (paciente_id, timestamp_inicio) OUTPUT INSERTED.id VALUES (?, GETDATE())", paciente_id)
         nova_sessao_id = cursor.fetchone().id
         
-        # *** CORREÇÃO SIMPLIFICADA: Salvar bateria atual se disponível ***
+        # Salvar bateria atual se disponível
         current_battery = connected_clients[patient_name_for_dict].get('battery')
         if current_battery is not None:
             cursor.execute(
@@ -1138,21 +1175,20 @@ def handle_session_stopped(by_client_data):
         emit_state_update() 
         print(f"Sessão do paciente '{patient_name}' removida da lista de ativas via app.")
 
-
 @socketio.on('resume_active_session')
 def handle_resume_session(data):
     patient_name = data.get('patientName')
     session_id = data.get('sessionId')
 
     if not patient_name or not session_id:
-        print(f"ERRO: patientName ou sessionId não fornecidos no resume_active_session")
+        print(f"❌ ERRO: patientName ou sessionId não fornecidos no resume_active_session")
         return
 
-    print(f"Recebido evento 'resume_active_session' do paciente '{patient_name}' para a sessão {session_id}")
+    print(f"🔄 Recebido evento 'resume_active_session' do paciente '{patient_name}' para a sessão {session_id}")
 
     conn = get_db_connection()
     if not conn: 
-        print(f"ERRO: Não foi possível conectar ao banco para retomar sessão {session_id}")
+        print(f"❌ ERRO: Não foi possível conectar ao banco para retomar sessão {session_id}")
         return
     
     total_amostras_db = 0
@@ -1167,9 +1203,12 @@ def handle_resume_session(data):
     except Exception as e:
         print(f"Erro ao buscar contagem de amostras para a sessão {session_id}: {e}")
 
+    # *** NOVO: Recuperar dados pendentes do cache ***
+    dados_recuperados = verificar_e_recuperar_dados_offline(session_id)
+
     # *** CORREÇÃO: Garantir que o paciente está em connected_clients ***
     if patient_name not in connected_clients:
-        print(f"AVISO: Paciente '{patient_name}' não está em connected_clients. Registrando novamente...")
+        print(f"⚠️ AVISO: Paciente '{patient_name}' não está em connected_clients. Registrando novamente...")
         connected_clients[patient_name] = {'sid': request.sid, 'battery': None}
 
     # *** CORREÇÃO: Recria o cache e INICIALIZA o contador com o valor do banco ***
@@ -1199,30 +1238,138 @@ def handle_resume_session(data):
                     'patient_name': patient_name
                 }
             
-            print(f"Sessão {session_id} do paciente '{patient_name}' restaurada na lista de ativas.")
-            print(f"Active sessions após restauração: {list(active_sessions.keys())}")
+            print(f"✅ Sessão {session_id} do paciente '{patient_name}' restaurada na lista de ativas.")
+            if dados_recuperados:
+                print(f"📊 Dados pendentes recuperados e sendo processados em background")
             
-            # *** CORREÇÃO: Emitir eventos de atualização ***
             socketio.emit('structure_changed')
             emit_state_update()
             
             # *** CORREÇÃO: Notificar o cliente que a sessão foi retomada ***
             socketio.emit('session_resumed', {
                 'sessionId': session_id,
-                'patientName': patient_name
+                'patientName': patient_name,
+                'dadosRecuperados': dados_recuperados
             }, room=request.sid)
             
         else:
-            print(f"ERRO: Paciente '{patient_name}' não encontrado no banco de dados.")
+            print(f"❌ ERRO: Paciente '{patient_name}' não encontrado no banco de dados.")
             
     except Exception as e:
-        print(f"Erro ao restaurar sessão: {e}")
+        print(f"❌ Erro ao restaurar sessão: {e}")
         import traceback
         traceback.print_exc()
     finally:
         if conn: 
             conn.close()
+
+
+@app.route('/data/offline-recovery', methods=['POST'])
+def receber_dados_offline():
+    """
+    Endpoint específico para recuperação de dados offline
+    """
+    try:
+        payload = request.get_json()
+        if not payload or 'sessao_id' not in payload or 'data' not in payload:
+            return jsonify({"status": "erro", "message": "Payload inválido"}), 400
+
+        sessao_id = int(payload['sessao_id'])
+        dados_leituras = payload['data']
         
+        if not dados_leituras:
+            return jsonify({"status": "sucesso", "message": "Nenhum dado para processar"}), 200
+
+        print(f"📱 Recebida recuperação offline para sessão {sessao_id}: {len(dados_leituras)} leituras")
+
+        # Processar em background sem sobrecarregar
+        socketio.start_background_task(
+            processar_dados_offline, 
+            sessao_id, 
+            dados_leituras
+        )
+        
+        return jsonify({
+            "status": "aceito", 
+            "message": f"Dados offline serão processados em background"
+        }), 202
+
+    except Exception as e:
+        print(f"❌ ERRO em /data/offline-recovery: {e}")
+        return jsonify({"status": "erro", "message": "Erro interno"}), 500
+
+
+# ==========================
+# FUNÇÕES PARA RECUPERAÇÃO OFFLINE
+# ==========================
+
+def processar_dados_offline(session_id, dados_acumulados):
+    """
+    Processa dados que foram acumulados durante período offline
+    """
+    try:
+        if not dados_acumulados:
+            return
+        
+        print(f"📱 Processando {len(dados_acumulados)} dados acumulados offline para sessão {session_id}")
+        
+        # Ordenar por timestamp
+        dados_ordenados = sorted(dados_acumulados, key=lambda x: x['timestamp'])
+        
+        # Dividir em lotes menores para evitar sobrecarga
+        tamanho_lote = 50
+        lotes = [dados_ordenados[i:i + tamanho_lote] for i in range(0, len(dados_ordenados), tamanho_lote)]
+        
+        for i, lote in enumerate(lotes):
+            print(f"📦 Processando lote {i+1}/{len(lotes)} com {len(lote)} dados")
+            
+            # Enviar para o endpoint batch para melhor performance
+            payload = {
+                'sessao_id': session_id,
+                'data': lote,
+                'is_offline_recovery': True  # Flag para identificar como recuperação offline
+            }
+            
+            # Usar fila batch para processamento assíncrono
+            DB_BATCH_QUEUE.put(payload)
+            
+            # Pequena pausa entre lotes para não sobrecarregar
+            time.sleep(0.05)
+            
+        print(f"✅ Processamento offline concluído para sessão {session_id}")
+        
+        # Marcar sessão para reanálise
+        with SESSOES_LOCK:
+            SESSOES_PARA_REANALISAR.add(session_id)
+        
+    except Exception as e:
+        print(f"❌ Erro ao processar dados offline: {e}")
+        import traceback
+        traceback.print_exc()
+
+def verificar_e_recuperar_dados_offline(session_id):
+    """
+    Verifica se há dados pendentes no cache e os processa
+    """
+    try:
+        with SESSAO_LOCKS[session_id]:
+            cache_deque = SESSAO_CACHE.get(session_id)
+            if cache_deque and len(cache_deque) > 0:
+                dados_pendentes = list(cache_deque)
+                print(f"🔄 Recuperando {len(dados_pendentes)} dados pendentes do cache para sessão {session_id}")
+                
+                # Processar dados pendentes
+                socketio.start_background_task(processar_dados_offline, session_id, dados_pendentes)
+                
+                # Limpar cache após processamento
+                cache_deque.clear()
+                return True
+        return False
+    except Exception as e:
+        print(f"❌ Erro ao recuperar dados offline: {e}")
+        return False
+
+
 # --- Função para obter IP local ---
 def get_ip():
     s = socket.socket(socket.AF_INET, socket.SOCK_DGRAM)
